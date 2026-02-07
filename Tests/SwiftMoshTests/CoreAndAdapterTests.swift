@@ -753,6 +753,205 @@ final class CoreAndAdapterTests: XCTestCase {
         await session.stop()
     }
 
+    func testPacketLossSimulationConvergesViaRetransmit() async throws {
+        var config = MoshClientConfig(
+            sendMinDelayMs: 0,
+            maxReceiveStates: 8,
+            ackIntervalMs: 1_000,
+            ackDelayMs: 100,
+            networkTimeoutMs: 3_000,
+            maxRetransmitCount: 5,
+            initialRtoMs: 80,
+            maxRtoMs: 80,
+            heartbeatIntervalMs: 10_000,
+            mtu: 256,
+            useNetworkCrypto: false
+        )
+        config.localPort = nil
+
+        let (rawClient, rawServer) = await InMemoryDatagramPair.makeLinked()
+        let chaoticClient = ChaosDatagramEndpoint(
+            base: rawClient,
+            dropSendOrdinals: [1, 2]
+        )
+        let session = MoshClientSession(
+            endpoint: makeEndpoint(),
+            config: config,
+            endpointFactory: { _, _ in chaoticClient },
+            snapshotEncoder: defaultSnapshotEncoder
+        )
+        let server = TransportEngine(endpoint: rawServer, outgoingDirection: .toClient, mtu: config.mtu)
+
+        try await server.start()
+        try await session.start()
+
+        try await session.enqueue(.keystrokes(Data("loss".utf8)))
+        let converged = try await receivePayloadEventually(engine: server, timeoutNs: 2_500_000_000)
+        let convergedInstruction = try decodeInstructionPayload(converged.payload, compressed: true)
+        XCTAssertEqual(convergedInstruction.newNum, 1)
+        let user = try UserMessage(decoding: convergedInstruction.diff ?? Data())
+        XCTAssertEqual(user.instructions.count, 1)
+        if case .keystroke(let bytes) = user.instructions[0] {
+            XCTAssertEqual(bytes, Data("loss".utf8))
+        } else {
+            XCTFail("Expected keystroke after retransmit convergence")
+        }
+        let droppedCount = await chaoticClient.droppedSendCount()
+        XCTAssertEqual(droppedCount, 2)
+
+        let ack = TransportInstruction(protocolVersion: MoshWire.protocolVersion, ackNum: 1)
+        let ackSeq = await server.reserveOutgoingSequence()
+        try await server.sendPayload(
+            try encodeInstructionPayload(ack, compressed: true),
+            sequence: ackSeq
+        )
+        let queueCleared = await waitForPendingOutboundCount(session: session, expected: 0, timeoutNs: 1_000_000_000)
+        XCTAssertTrue(queueCleared)
+
+        await session.stop()
+        await server.stop()
+    }
+
+    func testJitterSimulationPreservesOrderingAndSessionHealth() async throws {
+        var config = MoshClientConfig(
+            sendMinDelayMs: 0,
+            maxReceiveStates: 8,
+            ackIntervalMs: 1_000,
+            ackDelayMs: 100,
+            networkTimeoutMs: 3_000,
+            maxRetransmitCount: 4,
+            initialRtoMs: 100,
+            maxRtoMs: 100,
+            heartbeatIntervalMs: 10_000,
+            mtu: 256,
+            useNetworkCrypto: false
+        )
+        config.localPort = nil
+
+        let (rawClient, rawServer) = await InMemoryDatagramPair.makeLinked()
+        let chaoticClient = ChaosDatagramEndpoint(
+            base: rawClient,
+            dropSendOrdinals: [],
+            sendDelayMsByOrdinal: [1: 40, 2: 10, 3: 30]
+        )
+        let session = MoshClientSession(
+            endpoint: makeEndpoint(),
+            config: config,
+            endpointFactory: { _, _ in chaoticClient },
+            snapshotEncoder: defaultSnapshotEncoder
+        )
+        let server = TransportEngine(endpoint: rawServer, outgoingDirection: .toClient, mtu: config.mtu)
+
+        try await server.start()
+        try await session.start()
+
+        try await session.enqueue(.keystrokes(Data("j1".utf8)))
+        try await session.enqueue(.keystrokes(Data("j2".utf8)))
+
+        let first = try await receivePayloadEventually(engine: server, timeoutNs: 1_500_000_000)
+        let second = try await receivePayloadEventually(engine: server, timeoutNs: 1_500_000_000)
+        let firstInstruction = try decodeInstructionPayload(first.payload, compressed: true)
+        let secondInstruction = try decodeInstructionPayload(second.payload, compressed: true)
+        XCTAssertEqual(firstInstruction.newNum, 1)
+        XCTAssertEqual(secondInstruction.newNum, 2)
+
+        let ack = TransportInstruction(protocolVersion: MoshWire.protocolVersion, ackNum: 2)
+        let ackSeq = await server.reserveOutgoingSequence()
+        try await server.sendPayload(
+            try encodeInstructionPayload(ack, compressed: true),
+            sequence: ackSeq
+        )
+        let queueCleared = await waitForPendingOutboundCount(session: session, expected: 0, timeoutNs: 1_000_000_000)
+        XCTAssertTrue(queueCleared)
+        let sessionState = await session.state
+        XCTAssertEqual(sessionState, .running)
+
+        await session.stop()
+        await server.stop()
+    }
+
+    func testRoamSimulationRebindsToNewPeerWithoutSessionRestart() async throws {
+        var config = MoshClientConfig(
+            sendMinDelayMs: 0,
+            maxReceiveStates: 8,
+            ackIntervalMs: 1_000,
+            ackDelayMs: 100,
+            networkTimeoutMs: 4_000,
+            maxRetransmitCount: 5,
+            initialRtoMs: 100,
+            maxRtoMs: 100,
+            heartbeatIntervalMs: 10_000,
+            mtu: 256,
+            useNetworkCrypto: false
+        )
+        config.localPort = nil
+
+        let client = InMemoryDatagramEndpoint()
+        let serverA = InMemoryDatagramEndpoint()
+        await client.link(serverA)
+        await serverA.link(client)
+
+        let session = MoshClientSession(
+            endpoint: makeEndpoint(),
+            config: config,
+            endpointFactory: { _, _ in client },
+            snapshotEncoder: defaultSnapshotEncoder
+        )
+        let serverEngineA = TransportEngine(endpoint: serverA, outgoingDirection: .toClient, mtu: config.mtu)
+        try await serverEngineA.start()
+        try await session.start()
+
+        try await session.enqueue(.keystrokes(Data("before-roam".utf8)))
+        let beforeRoam = try await receivePayloadEventually(engine: serverEngineA, timeoutNs: 1_000_000_000)
+        let beforeRoamInstruction = try decodeInstructionPayload(beforeRoam.payload, compressed: true)
+        XCTAssertEqual(beforeRoamInstruction.newNum, 1)
+
+        let ack1 = TransportInstruction(protocolVersion: MoshWire.protocolVersion, ackNum: 1)
+        let ackSeq1 = await serverEngineA.reserveOutgoingSequence()
+        try await serverEngineA.sendPayload(
+            try encodeInstructionPayload(ack1, compressed: true),
+            sequence: ackSeq1
+        )
+        let clearedBeforeRoam = await waitForPendingOutboundCount(session: session, expected: 0, timeoutNs: 1_000_000_000)
+        XCTAssertTrue(clearedBeforeRoam)
+
+        let transportSnapshot = await serverEngineA.makeSnapshot()
+        await serverEngineA.stop()
+
+        let serverB = InMemoryDatagramEndpoint()
+        await client.link(serverB)
+        await serverB.link(client)
+        let serverEngineB = TransportEngine(endpoint: serverB, outgoingDirection: .toClient, mtu: config.mtu)
+        await serverEngineB.restore(from: transportSnapshot)
+        try await serverEngineB.start()
+
+        try await session.enqueue(.keystrokes(Data("after-roam".utf8)))
+        let afterRoam = try await receivePayloadEventually(engine: serverEngineB, timeoutNs: 1_500_000_000)
+        let afterRoamInstruction = try decodeInstructionPayload(afterRoam.payload, compressed: true)
+        XCTAssertEqual(afterRoamInstruction.newNum, 2)
+        let afterUser = try UserMessage(decoding: afterRoamInstruction.diff ?? Data())
+        XCTAssertEqual(afterUser.instructions.count, 1)
+        if case .keystroke(let bytes) = afterUser.instructions[0] {
+            XCTAssertEqual(bytes, Data("after-roam".utf8))
+        } else {
+            XCTFail("Expected keystroke after roam")
+        }
+
+        let ack2 = TransportInstruction(protocolVersion: MoshWire.protocolVersion, ackNum: 2)
+        let ackSeq2 = await serverEngineB.reserveOutgoingSequence()
+        try await serverEngineB.sendPayload(
+            try encodeInstructionPayload(ack2, compressed: true),
+            sequence: ackSeq2
+        )
+        let clearedAfterRoam = await waitForPendingOutboundCount(session: session, expected: 0, timeoutNs: 1_000_000_000)
+        XCTAssertTrue(clearedAfterRoam)
+        let sessionState = await session.state
+        XCTAssertEqual(sessionState, .running)
+
+        await session.stop()
+        await serverEngineB.stop()
+    }
+
     func testHostOpStreamYieldsAndFinishesOnStop() async throws {
         var config = MoshClientConfig(maxReceiveStates: 8, mtu: 256, useNetworkCrypto: false)
         config.localPort = nil
@@ -1280,6 +1479,64 @@ private actor BufferedDatagramEndpoint: DatagramEndpoint {
     func takeSentData() -> Data {
         guard !sent.isEmpty else { return Data() }
         return sent.removeFirst()
+    }
+}
+
+private actor ChaosDatagramEndpoint: DatagramEndpoint {
+    private let base: any DatagramEndpoint
+    private let dropSendOrdinals: Set<Int>
+    private let sendDelayMsByOrdinal: [Int: UInt64]
+    private let receiveDelayMsByOrdinal: [Int: UInt64]
+
+    private var sendOrdinal = 0
+    private var receiveOrdinal = 0
+    private var droppedSends = 0
+
+    init(
+        base: any DatagramEndpoint,
+        dropSendOrdinals: Set<Int> = [],
+        sendDelayMsByOrdinal: [Int: UInt64] = [:],
+        receiveDelayMsByOrdinal: [Int: UInt64] = [:]
+    ) {
+        self.base = base
+        self.dropSendOrdinals = dropSendOrdinals
+        self.sendDelayMsByOrdinal = sendDelayMsByOrdinal
+        self.receiveDelayMsByOrdinal = receiveDelayMsByOrdinal
+    }
+
+    func start() async throws {
+        try await base.start()
+    }
+
+    func stop() async {
+        await base.stop()
+    }
+
+    func send(_ data: Data) async throws {
+        sendOrdinal += 1
+        let current = sendOrdinal
+        if let delayMs = sendDelayMsByOrdinal[current], delayMs > 0 {
+            try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+        }
+        if dropSendOrdinals.contains(current) {
+            droppedSends += 1
+            return
+        }
+        try await base.send(data)
+    }
+
+    func receive() async throws -> TransportDatagram {
+        let datagram = try await base.receive()
+        receiveOrdinal += 1
+        let current = receiveOrdinal
+        if let delayMs = receiveDelayMsByOrdinal[current], delayMs > 0 {
+            try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+        }
+        return datagram
+    }
+
+    func droppedSendCount() -> Int {
+        droppedSends
     }
 }
 
