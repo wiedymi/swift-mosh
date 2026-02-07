@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+@testable import MoshBootstrap
 @testable import MoshCore
 
 final class RealMoshServerE2ETests: XCTestCase {
@@ -21,7 +22,7 @@ final class RealMoshServerE2ETests: XCTestCase {
         {
             connect = MoshConnectInfo(port: port, key: manualKey, serverPID: nil, serverOutput: nil)
         } else {
-            connect = try Self.launchLocalMoshServer()
+            connect = try Self.launchLocalMoshServer(environment: env)
             launchedServerPID = connect.serverPID
         }
 
@@ -62,7 +63,7 @@ final class RealMoshServerE2ETests: XCTestCase {
             if let launchedServerPID {
                 Self.terminateServerProcess(pid: launchedServerPID)
             }
-            let serverOutput = connect.serverOutput?.outputString ?? "<no server output captured>"
+            let serverOutput = connect.serverOutput ?? "<no server output captured>"
             XCTFail(
                 "Real E2E failed at stage '\(stage)' (host=\(host), port=\(connect.port), keyLen=\(connect.key.count)): \(error)\nServer output:\n\(serverOutput)"
             )
@@ -106,118 +107,26 @@ final class RealMoshServerE2ETests: XCTestCase {
         return nil
     }
 
-    private static func launchLocalMoshServer() throws -> MoshConnectInfo {
-        let env = ProcessInfo.processInfo.environment
-        let binary = try resolveMoshServerPath(env: env)
-        let bindAddress = env["SWIFTMOSH_REAL_E2E_BIND_ADDR"] ?? "127.0.0.1"
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: binary)
-        process.arguments = [
-            "new",
-            "-i", bindAddress,
-            "-p", "0",
-            "--",
-            "/bin/sh",
-            "-lc",
-            "exec cat"
-        ]
-
-        let combinedPipe = Pipe()
-        let collector = OutputCollector()
-        process.standardOutput = combinedPipe
-        process.standardError = combinedPipe
-        combinedPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                collector.append(data)
-            }
-        }
-
-        try process.run()
-        defer {
-            combinedPipe.fileHandleForReading.readabilityHandler = nil
-        }
-
-        let start = Date()
-        while Date().timeIntervalSince(start) < 5 {
-            if let connect = parseConnectInfo(from: collector.outputString) {
-                return MoshConnectInfo(
-                    port: connect.port,
-                    key: connect.key,
-                    serverPID: connect.serverPID,
-                    serverOutput: collector
-                )
-            }
-
-            if !process.isRunning {
-                break
-            }
-
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-
-        throw XCTSkip("Could not parse 'MOSH CONNECT' from mosh-server output: \(collector.outputString)")
-    }
-
-    private static func resolveMoshServerPath(env: [String: String]) throws -> String {
-        if let override = env["MOSH_SERVER_BIN"], !override.isEmpty {
-            return override
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["which", "mosh-server"]
-        let out = Pipe()
-        process.standardOutput = out
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
+    private static func launchLocalMoshServer(environment: [String: String]) throws -> MoshConnectInfo {
+        let bindAddress = environment["SWIFTMOSH_REAL_E2E_BIND_ADDR"] ?? "127.0.0.1"
+        do {
+            let connect = try MoshServerLauncher.launchLocalServer(
+                bindAddress: bindAddress,
+                timeout: 5,
+                environment: environment,
+                command: "exec cat"
+            )
+            return MoshConnectInfo(
+                port: connect.port,
+                key: connect.key,
+                serverPID: connect.serverPID.map { pid_t($0) },
+                serverOutput: connect.rawOutput
+            )
+        } catch MoshBootstrapError.missingServer {
             throw XCTSkip("mosh-server not found. Install mosh or set MOSH_SERVER_BIN=/path/to/mosh-server.")
+        } catch {
+            throw XCTSkip("Could not launch local mosh-server: \(error)")
         }
-
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        let path = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else {
-            throw XCTSkip("mosh-server path lookup returned empty output.")
-        }
-        return path
-    }
-
-    private static func parseConnectInfo(from output: String) -> MoshConnectInfo? {
-        let lines = output.split(whereSeparator: \.isNewline)
-        var matchedPort: UInt16?
-        var matchedKey: String?
-        var matchedPID: pid_t?
-
-        for line in lines {
-            let lineString = String(line)
-            if lineString.hasPrefix("MOSH CONNECT ") {
-                let parts = lineString.split(separator: " ")
-                if parts.count >= 4,
-                   let port = UInt16(parts[2]),
-                   parts[3].count == 22
-                {
-                    matchedPort = port
-                    matchedKey = String(parts[3])
-                }
-            } else if lineString.contains("pid = ") {
-                if let pidRange = lineString.range(of: "pid = ") {
-                    let pidString = lineString[pidRange.upperBound...]
-                        .prefix { $0.isNumber }
-                    if let pid = Int32(pidString) {
-                        matchedPID = pid
-                    }
-                }
-            }
-        }
-
-        if let port = matchedPort, let key = matchedKey {
-            return MoshConnectInfo(port: port, key: key, serverPID: matchedPID, serverOutput: nil)
-        }
-        return nil
     }
 
     private static func terminateServerProcess(pid: pid_t) {
@@ -230,24 +139,7 @@ private struct MoshConnectInfo {
     let port: UInt16
     let key: String
     let serverPID: pid_t?
-    let serverOutput: OutputCollector?
-}
-
-private final class OutputCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var buffer = Data()
-
-    var outputString: String {
-        lock.lock()
-        defer { lock.unlock() }
-        return String(decoding: buffer, as: UTF8.self)
-    }
-
-    func append(_ data: Data) {
-        lock.lock()
-        buffer.append(data)
-        lock.unlock()
-    }
+    let serverOutput: String?
 }
 
 private enum RealE2EError: Error {

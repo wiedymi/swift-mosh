@@ -6,19 +6,58 @@ import MoshTransport
 import MoshWire
 
 public actor MoshClientSession {
+    private struct PendingOutboundInstruction: Sendable {
+        var stateNum: UInt64
+        var payload: Data
+        var retryCount: UInt32
+        var lastSentAtMs: UInt64
+        var nextRetryAtMs: UInt64
+    }
+
+    private enum SessionRuntimeError: Error, Sendable {
+        case fatal(MoshSessionFailure)
+    }
+
     private let endpointFactory: @Sendable (MoshEndpoint, MoshClientConfig) -> any DatagramEndpoint
     private let snapshotEncoder: @Sendable (SessionStateBlob) throws -> Data
 
     private(set) public var endpoint: MoshEndpoint
     private(set) public var config: MoshClientConfig
+    private(set) public var state: MoshSessionState = .idle
+    private(set) public var failure: MoshSessionFailure?
 
     private var engine: TransportEngine?
     private var receiveTask: Task<Void, Never>?
+    private var maintenanceTask: Task<Void, Never>?
 
     private var pendingHostOps: [MoshHostOp] = []
     private var pendingTransportSnapshot: TransportRuntimeSnapshot?
 
     private var lastSentStateNum: UInt64 = 0
+    private var latestReceivedStateNum: UInt64 = 0
+
+    private var pendingOutbound: [UInt64: PendingOutboundInstruction] = [:]
+    private var pendingOutboundOrder: [UInt64] = []
+
+    private var lastInboundAtMs: UInt64 = 0
+    private var lastOutboundAtMs: UInt64 = 0
+    private var lastStateSendAtMs: UInt64 = 0
+
+    private var ackDirtyAtMs: UInt64?
+    private var lastAckSentAtMs: UInt64 = 0
+    private var lastAckReportedNum: UInt64 = 0
+
+    private var srttMs: Double?
+    private var rttvarMs: Double?
+    private var currentRtoMs: Double
+
+    private var appliedRemoteStateNums: Set<UInt64> = []
+
+    private var consecutiveReceiveFailures: UInt32 = 0
+    private let consecutiveFailureLimit: UInt32 = 8
+
+    private var hostStreamContinuations: [UUID: AsyncStream<MoshHostOp>.Continuation] = [:]
+
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
 
     public init(endpoint: MoshEndpoint, config: MoshClientConfig = .init()) {
@@ -31,6 +70,7 @@ public actor MoshClientSession {
             )
         }
         self.snapshotEncoder = Self.defaultSnapshotEncoder
+        self.currentRtoMs = Double(config.initialRtoMs)
     }
 
     init(
@@ -43,76 +83,128 @@ public actor MoshClientSession {
         self.config = config
         self.endpointFactory = endpointFactory
         self.snapshotEncoder = snapshotEncoder
+        self.currentRtoMs = Double(config.initialRtoMs)
     }
 
     public func start() async throws {
-        if engine != nil {
+        if case .running = state {
             return
+        }
+        if case .starting = state {
+            return
+        }
+        if case .failed(let reason) = state {
+            throw MoshSessionError.sessionFailed(reason)
         }
 
         guard !endpoint.host.isEmpty, endpoint.port > 0 else {
             throw MoshSessionError.invalidEndpoint
         }
 
-        let key = try MoshBase64Key(printableKey: endpoint.keyBase64_22)
+        state = .starting
 
-        let endpointImpl = endpointFactory(endpoint, config)
-        let runtimeEndpoint: any DatagramEndpoint
-        if config.useNetworkCrypto {
-            runtimeEndpoint = try MoshEncryptedDatagramEndpoint(wrapping: endpointImpl, key: key.raw)
-        } else {
-            runtimeEndpoint = endpointImpl
-        }
+        do {
+            let key = try MoshBase64Key(printableKey: endpoint.keyBase64_22)
 
-        let engine = TransportEngine(endpoint: runtimeEndpoint, outgoingDirection: .toServer, mtu: config.mtu)
-        try await engine.start()
+            let endpointImpl = endpointFactory(endpoint, config)
+            let runtimeEndpoint: any DatagramEndpoint
+            if config.useNetworkCrypto {
+                runtimeEndpoint = try MoshEncryptedDatagramEndpoint(wrapping: endpointImpl, key: key.raw)
+            } else {
+                runtimeEndpoint = endpointImpl
+            }
 
-        if let pendingTransportSnapshot {
-            await engine.restore(from: pendingTransportSnapshot)
-            self.pendingTransportSnapshot = nil
-        }
+            let engine = TransportEngine(endpoint: runtimeEndpoint, outgoingDirection: .toServer, mtu: config.mtu)
+            try await engine.start()
 
-        self.engine = engine
-        self.receiveTask = Task { [weak self] in
-            await self?.receiveLoop()
+            if let pendingTransportSnapshot {
+                await engine.restore(from: pendingTransportSnapshot)
+                self.pendingTransportSnapshot = nil
+            }
+
+            self.engine = engine
+            let now = TransportClock.nowMs()
+            lastInboundAtMs = now
+            lastOutboundAtMs = now
+            lastStateSendAtMs = 0
+            lastAckSentAtMs = now
+            ackDirtyAtMs = nil
+            consecutiveReceiveFailures = 0
+            currentRtoMs = Double(config.initialRtoMs)
+            srttMs = nil
+            rttvarMs = nil
+
+            state = .running
+            self.receiveTask = Task { [weak self] in
+                await self?.receiveLoop()
+            }
+            self.maintenanceTask = Task { [weak self] in
+                await self?.maintenanceLoop()
+            }
+        } catch {
+            state = .idle
+            throw error
         }
     }
 
     public func stop() async {
-        receiveTask?.cancel()
-        receiveTask = nil
-
-        if let engine {
-            await engine.stop()
-        }
-        engine = nil
+        state = .stopping
+        await shutdownRuntime()
+        state = .stopped
     }
 
     public func enqueue(_ op: MoshClientOp) async throws {
-        guard let engine else {
+        guard case .running = state else {
+            if case .failed(let reason) = state {
+                throw MoshSessionError.sessionFailed(reason)
+            }
             throw MoshSessionError.notStarted
         }
 
+        try await applySendMinDelayIfNeeded()
+
         let diff = try encodeUserDiff(from: op)
+        let stateNum = lastSentStateNum &+ 1
         let instruction = TransportInstruction(
             protocolVersion: MoshWire.protocolVersion,
             oldNum: lastSentStateNum,
-            newNum: lastSentStateNum &+ 1,
+            newNum: stateNum,
+            ackNum: latestReceivedStateNum,
+            throwawayNum: computeThrowawayNum(),
             diff: diff,
             chaff: Data()
         )
-        let encodedInstruction = instruction.encoded()
-        let compressed = try MoshCompressionCodec().compress(encodedInstruction, algorithm: .zlib)
 
-        let sequence = await engine.reserveOutgoingSequence()
-        try await engine.sendPayload(compressed, sequence: sequence)
-        lastSentStateNum &+= 1
+        let payload = try encodeInstruction(instruction)
+        try await sendPayload(payload)
+
+        let now = TransportClock.nowMs()
+        let pending = PendingOutboundInstruction(
+            stateNum: stateNum,
+            payload: payload,
+            retryCount: 0,
+            lastSentAtMs: now,
+            nextRetryAtMs: now &+ UInt64(currentRtoClampedMs())
+        )
+        pendingOutbound[stateNum] = pending
+        pendingOutboundOrder.append(stateNum)
+        lastSentStateNum = stateNum
     }
 
     public func drainHostOps() async -> [MoshHostOp] {
         let drained = pendingHostOps
         pendingHostOps.removeAll(keepingCapacity: true)
         return drained
+    }
+
+    public func hostOpStream() -> AsyncStream<MoshHostOp> {
+        let streamID = UUID()
+        return AsyncStream(MoshHostOp.self, bufferingPolicy: .unbounded) { continuation in
+            self.hostStreamContinuations[streamID] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeHostStreamContinuation(streamID) }
+            }
+        }
     }
 
     public func makeSnapshot() async throws -> MoshSnapshot {
@@ -165,6 +257,36 @@ public actor MoshClientSession {
         }
     }
 
+    private func maintenanceLoop() async {
+        while !Task.isCancelled {
+            guard case .running = state else {
+                return
+            }
+
+            let now = TransportClock.nowMs()
+            if now > lastInboundAtMs,
+               now - lastInboundAtMs > UInt64(config.networkTimeoutMs)
+            {
+                await failSession(.timeout(timeoutMs: config.networkTimeoutMs))
+                return
+            }
+
+            do {
+                try await processRetransmitQueue(nowMs: now)
+                try await maybeSendAck(nowMs: now)
+                try await maybeSendHeartbeat(nowMs: now)
+            } catch let SessionRuntimeError.fatal(failure) {
+                await failSession(failure)
+                return
+            } catch {
+                await failSession(.transportFailure("\(error)"))
+                return
+            }
+
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
     private static func defaultSnapshotEncoder(_ blob: SessionStateBlob) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -177,20 +299,40 @@ public actor MoshClientSession {
                 return false
             }
             let incoming = try await engine.receivePayload()
+            lastInboundAtMs = TransportClock.nowMs()
+            updateRtt(from: incoming)
+
             let hostOps = try decodeHostOps(from: incoming)
+            consecutiveReceiveFailures = 0
+
             if !hostOps.isEmpty {
-                pendingHostOps.append(contentsOf: hostOps)
-                if pendingHostOps.count > config.maxReceiveStates {
-                    let overflow = pendingHostOps.count - config.maxReceiveStates
-                    pendingHostOps.removeFirst(overflow)
-                }
+                publishHostOps(hostOps)
             }
         } catch {
-            if debugEnabled {
-                debugLog("receive loop iteration error: \(error)")
-            }
-            if Task.isCancelled {
+            if Task.isCancelled || state == .stopping || state == .stopped {
                 return false
+            }
+
+            let disposition = classifyReceiveError(error)
+            switch disposition {
+            case .fatal(let reason):
+                await failSession(reason)
+                return false
+            case .transient(let delayMs, let message):
+                consecutiveReceiveFailures &+= 1
+                if debugEnabled {
+                    debugLog("transient receive error (\(consecutiveReceiveFailures)): \(message)")
+                }
+                if consecutiveReceiveFailures >= consecutiveFailureLimit {
+                    await failSession(
+                        .circuitBreakerTripped(
+                            consecutiveFailures: consecutiveReceiveFailures,
+                            message: message
+                        )
+                    )
+                    return false
+                }
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
             }
         }
         return true
@@ -198,6 +340,155 @@ public actor MoshClientSession {
 
     func _testRunReceiveLoopIteration() async -> Bool {
         await runReceiveLoopIteration()
+    }
+
+    func _testPendingOutboundCount() -> Int {
+        pendingOutbound.count
+    }
+
+    func _testCurrentRtoMs() -> UInt32 {
+        currentRtoClampedMs()
+    }
+
+    func _testDecodeHostOps(
+        instruction: TransportInstruction,
+        compressed: Bool = true,
+        timestampReply: UInt16 = UInt16.max
+    ) throws -> [MoshHostOp] {
+        let payload: Data
+        if compressed {
+            payload = try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib)
+        } else {
+            payload = instruction.encoded()
+        }
+        return try decodeHostOps(
+            from: TransportReceivedPayload(
+                sequence: 0,
+                direction: .toClient,
+                timestamp: 0,
+                timestampReply: timestampReply,
+                payload: payload
+            )
+        )
+    }
+
+    func _testClassifyReceiveError(_ error: Error) -> MoshSessionFailure? {
+        switch classifyReceiveError(error) {
+        case .fatal(let failure):
+            return failure
+        case .transient:
+            return nil
+        }
+    }
+
+    func _testApplyRttSample(_ sample: Double) {
+        applyRttSample(sample)
+    }
+
+    func _testSetRttState(srttMs: Double?, rttvarMs: Double?) {
+        self.srttMs = srttMs
+        self.rttvarMs = rttvarMs
+    }
+
+    func _testUpdateRtt(timestampReply: UInt16) {
+        updateRtt(
+            from: TransportReceivedPayload(
+                sequence: 0,
+                direction: .toClient,
+                timestamp: 0,
+                timestampReply: timestampReply,
+                payload: Data()
+            )
+        )
+    }
+
+    func _testInstructionHasContent(_ instruction: TransportInstruction) -> Bool {
+        instructionHasContent(instruction)
+    }
+
+    func _testAcknowledgePendingOutbound(through ackNum: UInt64) {
+        acknowledgePendingOutbound(through: ackNum)
+    }
+
+    func _testPruneAppliedRemoteStates(before throwawayNum: UInt64) {
+        pruneAppliedRemoteStates(before: throwawayNum)
+    }
+
+    func _testSetAppliedRemoteStates(_ states: Set<UInt64>, latestReceivedStateNum: UInt64) {
+        self.appliedRemoteStateNums = states
+        self.latestReceivedStateNum = latestReceivedStateNum
+    }
+
+    func _testSeedPendingOutboundOrderWithoutPayload(stateNum: UInt64) {
+        pendingOutboundOrder = [stateNum]
+        pendingOutbound.removeAll(keepingCapacity: false)
+    }
+
+    func _testSetAckState(
+        latestReceivedStateNum: UInt64,
+        lastAckReportedNum: UInt64,
+        lastAckSentAtMs: UInt64,
+        ackDirtyAtMs: UInt64?
+    ) {
+        self.latestReceivedStateNum = latestReceivedStateNum
+        self.lastAckReportedNum = lastAckReportedNum
+        self.lastAckSentAtMs = lastAckSentAtMs
+        self.ackDirtyAtMs = ackDirtyAtMs
+    }
+
+    func _testSetLastStateSendAtMs(_ value: UInt64) {
+        lastStateSendAtMs = value
+    }
+
+    func _testSetLastOutboundAtMs(_ value: UInt64) {
+        lastOutboundAtMs = value
+    }
+
+    func _testRunProcessRetransmitQueue(nowMs: UInt64) async throws {
+        try await processRetransmitQueue(nowMs: nowMs)
+    }
+
+    func _testRunMaybeSendAck(nowMs: UInt64) async throws {
+        try await maybeSendAck(nowMs: nowMs)
+    }
+
+    func _testRunMaybeSendHeartbeat(nowMs: UInt64) async throws {
+        try await maybeSendHeartbeat(nowMs: nowMs)
+    }
+
+    func _testApplySendMinDelayIfNeeded() async throws {
+        try await applySendMinDelayIfNeeded()
+    }
+
+    func _testFailSession(_ failure: MoshSessionFailure) async {
+        await failSession(failure)
+    }
+
+    func _testSendPayload(_ payload: Data) async throws {
+        try await sendPayload(payload)
+    }
+
+    func _testSetStateForMaintenanceCoverage(
+        state: MoshSessionState,
+        lastInboundAtMs: UInt64,
+        lastOutboundAtMs: UInt64,
+        lastAckSentAtMs: UInt64,
+        latestReceivedStateNum: UInt64,
+        lastAckReportedNum: UInt64,
+        ackDirtyAtMs: UInt64?
+    ) {
+        self.state = state
+        self.lastInboundAtMs = lastInboundAtMs
+        self.lastOutboundAtMs = lastOutboundAtMs
+        self.lastAckSentAtMs = lastAckSentAtMs
+        self.latestReceivedStateNum = latestReceivedStateNum
+        self.lastAckReportedNum = lastAckReportedNum
+        self.ackDirtyAtMs = ackDirtyAtMs
+        self.engine = nil
+    }
+
+    func _testRunMaintenanceLoopForCoverage() async {
+        await maintenanceLoop()
     }
 
     private func encodeUserDiff(from op: MoshClientOp) throws -> Data {
@@ -214,47 +505,58 @@ public actor MoshClientSession {
             return []
         }
 
-        let decompressed = try? MoshCompressionCodec().decompress(incoming.payload, algorithm: .zlib)
-        let instructionBytes = decompressed ?? incoming.payload
+        let codec = MoshCompressionCodec()
+        let decompressed = try? codec.decompress(incoming.payload, algorithm: .zlib)
+        let instructionBytes: Data
+        let instruction: TransportInstruction
+        if let decompressed,
+           let candidate = try? TransportInstruction(decoding: decompressed),
+           instructionHasContent(candidate)
+        {
+            instructionBytes = decompressed
+            instruction = candidate
+        } else {
+            instructionBytes = incoming.payload
+            instruction = try TransportInstruction(decoding: instructionBytes)
+        }
         if debugEnabled {
             debugLog(
                 "decodeHostOps payloadLen=\(incoming.payload.count) decompressedLen=\(decompressed?.count ?? -1) instructionLen=\(instructionBytes.count)"
             )
         }
 
-        let instruction: TransportInstruction
-        do {
-            instruction = try TransportInstruction(decoding: instructionBytes)
-        } catch {
-            if debugEnabled {
-                debugLog("TransportInstruction decode error: \(error)")
-            }
-            throw error
-        }
-        if debugEnabled {
-            debugLog(
-                "incoming seq=\(incoming.sequence) dir=\(incoming.direction) proto=\(String(describing: instruction.protocolVersion)) old=\(String(describing: instruction.oldNum)) new=\(String(describing: instruction.newNum)) ack=\(String(describing: instruction.ackNum)) throw=\(String(describing: instruction.throwawayNum)) diff=\(instruction.diff?.count ?? 0) chaff=\(instruction.chaff?.count ?? 0)"
-            )
+        if let version = instruction.protocolVersion, version != MoshWire.protocolVersion {
+            throw SessionRuntimeError.fatal(.protocolViolation("mosh protocol mismatch: got \(version)"))
         }
 
-        if let version = instruction.protocolVersion, version != MoshWire.protocolVersion {
-            if debugEnabled {
-                debugLog("dropping incoming due protocol mismatch: \(version)")
+        if let ack = instruction.ackNum {
+            acknowledgePendingOutbound(through: ack)
+        }
+        if let throwaway = instruction.throwawayNum, throwaway > 0 {
+            pruneAppliedRemoteStates(before: throwaway)
+        }
+
+        if let newNum = instruction.newNum {
+            if appliedRemoteStateNums.contains(newNum) {
+                return []
             }
-            return []
+            if let oldNum = instruction.oldNum, oldNum > latestReceivedStateNum {
+                return []
+            }
+            latestReceivedStateNum = max(latestReceivedStateNum, newNum)
+            appliedRemoteStateNums.insert(newNum)
+            if appliedRemoteStateNums.count > 4096 {
+                let floor = latestReceivedStateNum > 2048 ? latestReceivedStateNum - 2048 : 0
+                appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= floor })
+            }
+            ackDirtyAtMs = TransportClock.nowMs()
         }
 
         guard let diff = instruction.diff else {
-            if debugEnabled {
-                debugLog("dropping incoming with no diff")
-            }
             return []
         }
 
-        if let hostMessage = try? HostMessage(decoding: diff) {
-            if debugEnabled {
-                debugLog("decoded HostMessage instructionCount=\(hostMessage.instructions.count)")
-            }
+        if let hostMessage = try? HostMessage(decoding: diff), !hostMessage.instructions.isEmpty {
             return hostMessage.instructions.map { instruction in
                 switch instruction {
                 case .hostBytes(let bytes):
@@ -267,10 +569,267 @@ public actor MoshClientSession {
             }
         }
 
-        if debugEnabled {
-            debugLog("HostMessage decode failed, using fallback hostBytes diffLen=\(diff.count)")
-        }
         return [.hostBytes(diff)]
+    }
+
+    private func instructionHasContent(_ instruction: TransportInstruction) -> Bool {
+        instruction.protocolVersion != nil ||
+            instruction.oldNum != nil ||
+            instruction.newNum != nil ||
+            instruction.ackNum != nil ||
+            instruction.throwawayNum != nil ||
+            instruction.diff != nil ||
+            instruction.chaff != nil
+    }
+
+    private func updateRtt(from incoming: TransportReceivedPayload) {
+        guard incoming.timestampReply != UInt16.max else {
+            return
+        }
+
+        let now16 = MoshWire.timestamp16(nowMilliseconds: TransportClock.nowMs())
+        let sample = Double(MoshWire.timestampDiff(new: now16, old: incoming.timestampReply))
+        applyRttSample(sample)
+    }
+
+    private func applyRttSample(_ sample: Double) {
+        guard sample > 0, sample < 5_000 else {
+            return
+        }
+
+        if srttMs == nil {
+            srttMs = sample
+            rttvarMs = sample / 2
+        } else {
+            let alpha = 1.0 / 8.0
+            let beta = 1.0 / 4.0
+            let oldSrtt = srttMs!
+            let oldRttvar = rttvarMs ?? (sample / 2)
+            rttvarMs = ((1 - beta) * oldRttvar) + (beta * abs(oldSrtt - sample))
+            srttMs = ((1 - alpha) * oldSrtt) + (alpha * sample)
+        }
+
+        let srtt = srttMs!
+        let rttvar = rttvarMs!
+        let candidate = srtt + max(10, 4 * rttvar)
+        currentRtoMs = min(
+            Double(config.maxRtoMs),
+            max(Double(config.initialRtoMs), candidate)
+        )
+    }
+
+    private func acknowledgePendingOutbound(through ackNum: UInt64) {
+        let acknowledged = pendingOutboundOrder.filter { $0 <= ackNum }
+        guard !acknowledged.isEmpty else { return }
+
+        for stateNum in acknowledged {
+            pendingOutbound.removeValue(forKey: stateNum)
+        }
+        pendingOutboundOrder.removeAll { $0 <= ackNum }
+    }
+
+    private func pruneAppliedRemoteStates(before throwawayNum: UInt64) {
+        guard throwawayNum > 0 else { return }
+        appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= throwawayNum })
+    }
+
+    private func processRetransmitQueue(nowMs: UInt64) async throws {
+        for stateNum in pendingOutboundOrder {
+            guard var pending = pendingOutbound[stateNum] else { continue }
+            guard nowMs >= pending.nextRetryAtMs else { continue }
+
+            if pending.retryCount >= config.maxRetransmitCount {
+                throw SessionRuntimeError.fatal(
+                    .retryLimitExceeded(
+                        stateNum: stateNum,
+                        retryCount: pending.retryCount
+                    )
+                )
+            }
+
+            try await sendPayload(pending.payload)
+            pending.retryCount &+= 1
+            pending.lastSentAtMs = nowMs
+            pending.nextRetryAtMs = nowMs &+ UInt64(currentRtoClampedMs())
+            pendingOutbound[stateNum] = pending
+        }
+    }
+
+    private func maybeSendAck(nowMs: UInt64) async throws {
+        guard let ackDirtyAtMs else {
+            if nowMs >= lastAckSentAtMs,
+               nowMs - lastAckSentAtMs >= UInt64(config.ackIntervalMs),
+               latestReceivedStateNum > lastAckReportedNum
+            {
+                try await sendAckOnly(nowMs: nowMs)
+            }
+            return
+        }
+
+        let delayElapsed = nowMs >= ackDirtyAtMs && (nowMs - ackDirtyAtMs >= UInt64(config.ackDelayMs))
+        let intervalElapsed = nowMs >= lastAckSentAtMs && (nowMs - lastAckSentAtMs >= UInt64(config.ackIntervalMs))
+        if delayElapsed || intervalElapsed {
+            try await sendAckOnly(nowMs: nowMs)
+        }
+    }
+
+    private func maybeSendHeartbeat(nowMs: UInt64) async throws {
+        guard nowMs >= lastOutboundAtMs else { return }
+        guard nowMs - lastOutboundAtMs >= UInt64(config.heartbeatIntervalMs) else { return }
+
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: lastSentStateNum,
+            newNum: lastSentStateNum,
+            ackNum: latestReceivedStateNum,
+            throwawayNum: computeThrowawayNum(),
+            diff: nil,
+            chaff: Data()
+        )
+        try await sendPayload(try encodeInstruction(instruction))
+        lastAckSentAtMs = nowMs
+        lastAckReportedNum = latestReceivedStateNum
+        ackDirtyAtMs = nil
+    }
+
+    private func sendAckOnly(nowMs: UInt64) async throws {
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: lastSentStateNum,
+            newNum: lastSentStateNum,
+            ackNum: latestReceivedStateNum,
+            throwawayNum: computeThrowawayNum(),
+            diff: nil,
+            chaff: Data()
+        )
+        try await sendPayload(try encodeInstruction(instruction))
+        lastAckSentAtMs = nowMs
+        lastAckReportedNum = latestReceivedStateNum
+        ackDirtyAtMs = nil
+    }
+
+    private func applySendMinDelayIfNeeded() async throws {
+        guard config.sendMinDelayMs > 0 else { return }
+        guard lastStateSendAtMs > 0 else {
+            lastStateSendAtMs = TransportClock.nowMs()
+            return
+        }
+
+        let now = TransportClock.nowMs()
+        let elapsed = now >= lastStateSendAtMs ? now - lastStateSendAtMs : 0
+        if elapsed < UInt64(config.sendMinDelayMs) {
+            let sleepMs = UInt64(config.sendMinDelayMs) - elapsed
+            try await Task.sleep(nanoseconds: sleepMs * 1_000_000)
+        }
+        lastStateSendAtMs = TransportClock.nowMs()
+    }
+
+    private func sendPayload(_ payload: Data) async throws {
+        guard let engine else {
+            throw MoshSessionError.notStarted
+        }
+        let sequence = await engine.reserveOutgoingSequence()
+        try await engine.sendPayload(payload, sequence: sequence)
+        lastOutboundAtMs = TransportClock.nowMs()
+    }
+
+    private func encodeInstruction(_ instruction: TransportInstruction) throws -> Data {
+        let encodedInstruction = instruction.encoded()
+        return try MoshCompressionCodec().compress(encodedInstruction, algorithm: .zlib)
+    }
+
+    private func computeThrowawayNum() -> UInt64 {
+        pendingOutboundOrder.first ?? 0
+    }
+
+    private func currentRtoClampedMs() -> UInt32 {
+        let rounded = UInt32(max(1, Int(currentRtoMs.rounded())))
+        return min(config.maxRtoMs, max(config.initialRtoMs, rounded))
+    }
+
+    private func publishHostOps(_ hostOps: [MoshHostOp]) {
+        pendingHostOps.append(contentsOf: hostOps)
+        if pendingHostOps.count > config.maxReceiveStates {
+            let overflow = pendingHostOps.count - config.maxReceiveStates
+            pendingHostOps.removeFirst(overflow)
+        }
+
+        for op in hostOps {
+            for continuation in hostStreamContinuations.values {
+                continuation.yield(op)
+            }
+        }
+    }
+
+    private func removeHostStreamContinuation(_ streamID: UUID) {
+        hostStreamContinuations.removeValue(forKey: streamID)
+    }
+
+    private func finishHostStreams() {
+        let continuations = hostStreamContinuations.values
+        hostStreamContinuations.removeAll(keepingCapacity: false)
+        for continuation in continuations {
+            continuation.finish()
+        }
+    }
+
+    private func shutdownRuntime() async {
+        receiveTask?.cancel()
+        maintenanceTask?.cancel()
+        receiveTask = nil
+        maintenanceTask = nil
+
+        if let engine {
+            await engine.stop()
+        }
+        engine = nil
+        finishHostStreams()
+    }
+
+    private func failSession(_ failure: MoshSessionFailure) async {
+        if case .failed = state {
+            return
+        }
+        self.failure = failure
+        state = .failed(failure)
+        await shutdownRuntime()
+    }
+
+    private enum ReceiveErrorDisposition {
+        case transient(delayMs: UInt64, message: String)
+        case fatal(MoshSessionFailure)
+    }
+
+    private func classifyReceiveError(_ error: Error) -> ReceiveErrorDisposition {
+        if let runtime = error as? SessionRuntimeError {
+            switch runtime {
+            case .fatal(let failure):
+                return .fatal(failure)
+            }
+        }
+
+        if let transport = error as? TransportError {
+            switch transport {
+            case .networkFailure(let message), .sendFailure(let message):
+                let delay = min(1_000, UInt64(50) << min(6, consecutiveReceiveFailures))
+                return .transient(delayMs: delay, message: message)
+            case .cancelled:
+                return .fatal(.transportFailure("cancelled"))
+            default:
+                return .fatal(.transportFailure("\(transport)"))
+            }
+        }
+
+        if let crypto = error as? OCBCipherError {
+            return .fatal(.authenticationFailure("\(crypto)"))
+        }
+
+        if error is ProtoLiteError || error is MoshWireError {
+            return .fatal(.protocolViolation("\(error)"))
+        }
+
+        let delay = min(1_000, UInt64(50) << min(6, consecutiveReceiveFailures))
+        return .transient(delayMs: delay, message: "\(error)")
     }
 
     private func debugLog(_ message: String) {

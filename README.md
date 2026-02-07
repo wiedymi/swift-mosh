@@ -21,8 +21,9 @@ Terminal UI/render adapters (Ghostty, SwiftUI terminal widgets, etc.) are intent
   - `MoshProtoLite`
   - `MoshCryptoOCB`
   - `MoshCompression`
+  - `MoshBootstrap` (optional SSH handoff parser/helper)
 - Real local `mosh-server` E2E test harness
-- 100% test coverage across `Sources/`
+- 100% automated test coverage across `Sources/` (via `./scripts/coverage.sh`)
 
 ## Platforms
 
@@ -68,9 +69,8 @@ try await session.start()
 
 try await session.enqueue(.keystrokes(Data("echo hello from swift-mosh\n".utf8)))
 
-// Poll host output and feed it into your own terminal renderer.
-let hostOps = await session.drainHostOps()
-for op in hostOps {
+// Streaming host output for your renderer.
+for await op in await session.hostOpStream() {
     if case .hostBytes(let bytes) = op {
         print(String(decoding: bytes, as: UTF8.self), terminator: "")
     }
@@ -78,6 +78,16 @@ for op in hostOps {
 
 await session.stop()
 ```
+
+Reliability/lifecycle knobs are configurable in `MoshClientConfig`:
+- `sendMinDelayMs`
+- `ackIntervalMs`
+- `ackDelayMs`
+- `networkTimeoutMs`
+- `heartbeatIntervalMs`
+- `initialRtoMs`
+- `maxRtoMs`
+- `maxRetransmitCount`
 
 ## Running tests
 
@@ -101,6 +111,17 @@ Or directly:
 
 ```bash
 SWIFTMOSH_REAL_E2E=1 swift test --filter RealMoshServerE2ETests
+```
+
+## Optional Bootstrap Helper
+
+`MoshBootstrap` can parse noisy `mosh-server` output and launch a local server:
+
+```swift
+import MoshBootstrap
+
+let connect = try MoshServerLauncher.launchLocalServer()
+// connect.port, connect.key, connect.serverPID
 ```
 
 ## Notes

@@ -13,13 +13,15 @@ let package = Package(
         .library(name: "MoshWire", targets: ["MoshWire"]),
         .library(name: "MoshProtoLite", targets: ["MoshProtoLite"]),
         .library(name: "MoshCryptoOCB", targets: ["MoshCryptoOCB"]),
-        .library(name: "MoshCompression", targets: ["MoshCompression"])
+        .library(name: "MoshCompression", targets: ["MoshCompression"]),
+        .library(name: "MoshBootstrap", targets: ["MoshBootstrap"])
     ],
     targets: [
         .target(name: "MoshWire"),
         .target(name: "MoshProtoLite"),
         .target(name: "MoshCryptoOCB"),
         .target(name: "MoshCompression"),
+        .target(name: "MoshBootstrap"),
         .target(
             name: "MoshTransport",
             dependencies: ["MoshWire"]
@@ -42,7 +44,8 @@ let package = Package(
                 "MoshWire",
                 "MoshProtoLite",
                 "MoshCryptoOCB",
-                "MoshCompression"
+                "MoshCompression",
+                "MoshBootstrap"
             ],
             path: "Tests/SwiftMoshTests"
         )
