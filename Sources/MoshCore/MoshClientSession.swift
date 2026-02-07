@@ -540,10 +540,16 @@ public actor MoshClientSession {
             if appliedRemoteStateNums.contains(newNum) {
                 return []
             }
-            if let oldNum = instruction.oldNum, oldNum > latestReceivedStateNum {
+            guard let oldNum = instruction.oldNum else {
                 return []
             }
-            latestReceivedStateNum = max(latestReceivedStateNum, newNum)
+            // A state's diff is relative to `oldNum`. This client currently tracks only
+            // the latest applied remote base, so we can safely apply the diff only when
+            // the reference base matches that exact state.
+            if oldNum != latestReceivedStateNum {
+                return []
+            }
+            latestReceivedStateNum = newNum
             appliedRemoteStateNums.insert(newNum)
             if appliedRemoteStateNums.count > 4096 {
                 let floor = latestReceivedStateNum > 2048 ? latestReceivedStateNum - 2048 : 0

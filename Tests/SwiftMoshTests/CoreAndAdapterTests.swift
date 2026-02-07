@@ -397,6 +397,17 @@ final class CoreAndAdapterTests: XCTestCase {
         )
         XCTAssertEqual(oldAhead, [])
 
+        // Cover stale-old-state guard: oldNum lower than latest should also be discarded.
+        let staleOld = try await session._testDecodeHostOps(
+            instruction: TransportInstruction(
+                protocolVersion: MoshWire.protocolVersion,
+                oldNum: 0,
+                newNum: 2,
+                diff: HostMessage(instructions: [.hostBytes(Data("stale".utf8))]).encoded()
+            )
+        )
+        XCTAssertEqual(staleOld, [])
+
         for index in 2...4100 {
             _ = try await session._testDecodeHostOps(
                 instruction: TransportInstruction(
