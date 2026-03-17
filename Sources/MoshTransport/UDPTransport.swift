@@ -34,7 +34,7 @@ public enum TransportError: Error, Sendable {
 
 public enum TransportClock {
     public static func nowMs() -> UInt64 {
-        UInt64(Date().timeIntervalSince1970 * 1_000)
+        UInt64(ProcessInfo.processInfo.systemUptime * 1_000)
     }
 }
 
