@@ -230,6 +230,70 @@ final class MoshProtocolE2ETests: XCTestCase {
         XCTAssertEqual(echoedStr, input, "All keystrokes must be echoed. Got '\(echoedStr)' expected '\(input)'")
     }
 
+    /// Simulates the VivyTerm race: data arrives between start()+resize and
+    /// hostOpStream() creation. The stream must replay buffered ops.
+    func testHostOpStreamReplaysBufferedOps() async throws {
+        let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
+        let key = Data(repeating: 0x42, count: 16)
+
+        let endpoint = MoshEndpoint(host: "127.0.0.1", port: 60001, keyBase64_22: try MoshBase64Key(raw: key).printable)
+        var config = MoshClientConfig()
+        config.useNetworkCrypto = true
+        config.ackDelayMs = 5000
+        config.heartbeatIntervalMs = 5000
+
+        let session = MoshClientSession(
+            endpoint: endpoint,
+            config: config,
+            endpointFactory: { _, _ in clientEnd },
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+        )
+        try await session.start()
+
+        // Send resize (like VivyTerm does BEFORE creating the stream)
+        try await session.enqueue(.resize(cols: 80, rows: 24))
+
+        try await serverEnd.start()
+        let serverCipher = try OCBTransportCipher(key: key)
+        let serverEngine = TransportEngine(endpoint: serverEnd, outgoingDirection: .toClient, cipher: serverCipher)
+
+        // Drain the resize from server
+        _ = try await serverEngine.receivePayload()
+
+        // Server sends tmux-like initial output BEFORE client creates hostOpStream
+        let tmuxOutput = "\u{1b}[?1049h\u{1b}[22;0;0t" + // alternate screen
+            String(repeating: " ", count: 80 * 24) + // blank pane
+            "\u{1b}[25;1H\u{1b}[42m[0] 0:bash*\u{1b}[0m" // status bar
+        let hostMsg = HostMessage(instructions: [.hostBytes(Data(tmuxOutput.utf8))])
+        let instruction = TransportInstruction(
+            protocolVersion: 2, oldNum: 0, newNum: 1, ackNum: 1, throwawayNum: 0,
+            diff: hostMsg.encoded(), chaff: Data()
+        )
+        let payload = try MoshCompressionCodec().compress(instruction.encoded(), algorithm: .zlib)
+        try await serverEngine.sendPayload(payload)
+
+        // Wait for client to process it into pendingHostOps
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // NOW create the stream (this is what VivyTerm does after startMoshShell returns)
+        let stream = await session.hostOpStream()
+
+        // The stream MUST replay the buffered ops
+        var gotData = false
+        let deadline = Date().addingTimeInterval(0.5)
+        for await op in stream {
+            if case .hostBytes(let bytes) = op, !bytes.isEmpty {
+                gotData = true
+                break
+            }
+            if Date() > deadline { break }
+        }
+
+        XCTAssertTrue(gotData, "hostOpStream must replay ops received before stream creation (tmux initial draw)")
+
+        await session.stop()
+    }
+
     /// Real mosh-server E2E: measures actual keystroke round-trip latency
     func testRealServerKeystrokeLatency() async throws {
         let env = ProcessInfo.processInfo.environment

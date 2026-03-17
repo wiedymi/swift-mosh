@@ -194,6 +194,9 @@ public actor MoshClientSession {
     public func hostOpStream() -> AsyncStream<MoshHostOp> {
         let streamID = UUID()
         return AsyncStream(MoshHostOp.self, bufferingPolicy: .unbounded) { continuation in
+            for op in self.pendingHostOps {
+                continuation.yield(op)
+            }
             self.hostStreamContinuations[streamID] = continuation
             continuation.onTermination = { [weak self] _ in
                 Task { await self?.removeHostStreamContinuation(streamID) }
