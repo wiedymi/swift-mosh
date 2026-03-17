@@ -214,7 +214,7 @@ public struct MoshFragmentAssembly: Sendable {
     }
 }
 
-private extension Data {
+public extension Data {
     mutating func appendBigEndian<T: FixedWidthInteger>(_ value: T) {
         var be = value.bigEndian
         Swift.withUnsafeBytes(of: &be) { bytes in

@@ -3,6 +3,39 @@ import MoshCryptoOCB
 import MoshTransport
 import MoshWire
 
+struct OCBTransportCipher: TransportCipher {
+    private let cipher: OCBCipher
+
+    init(key: Data) throws {
+        self.cipher = try OCBCipher(key: key)
+    }
+
+    func seal(directionalSequence: UInt64, plaintext: Data) throws -> Data {
+        let nonce = OCBNonce.from(messageID: 0, sequence: directionalSequence)
+        let sealed = try cipher.seal(plaintext: plaintext, nonce: nonce)
+
+        var out = Data(capacity: 8 + sealed.ciphertext.count + sealed.tag.count)
+        out.appendBigEndian(directionalSequence)
+        out.append(sealed.ciphertext)
+        out.append(sealed.tag)
+        return out
+    }
+
+    func open(datagram: Data) throws -> (directionalSequence: UInt64, plaintext: Data) {
+        guard datagram.count >= 8 + 16 else {
+            throw MoshWireError.truncated
+        }
+        var cursor = 0
+        let dirSeq = try datagram.readBigEndian(UInt64.self, cursor: &cursor)
+        let body = Data(datagram[cursor...])
+        let ciphertext = Data(body.dropLast(16))
+        let tag = Data(body.suffix(16))
+        let nonce = OCBNonce.from(messageID: 0, sequence: dirSeq)
+        let plaintext = try cipher.open(ciphertext: ciphertext, nonce: nonce, tag: tag)
+        return (dirSeq, plaintext)
+    }
+}
+
 actor MoshEncryptedDatagramEndpoint: DatagramEndpoint {
     private let wrapped: any DatagramEndpoint
     private let cipher: OCBCipher
@@ -28,14 +61,14 @@ actor MoshEncryptedDatagramEndpoint: DatagramEndpoint {
         let nonce = OCBNonce.from(messageID: 0, sequence: directionalSequence)
 
         var plaintext = Data()
-        plaintext.appendUInt16BE(packet.timestamp)
-        plaintext.appendUInt16BE(packet.timestampReply)
+        plaintext.appendBigEndian(packet.timestamp)
+        plaintext.appendBigEndian(packet.timestampReply)
         plaintext.append(packet.payload)
 
         let sealed = try cipher.seal(plaintext: plaintext, nonce: nonce)
 
         var encryptedDatagram = Data()
-        encryptedDatagram.appendUInt64BE(directionalSequence)
+        encryptedDatagram.appendBigEndian(directionalSequence)
         encryptedDatagram.append(sealed.ciphertext)
         encryptedDatagram.append(sealed.tag)
         if debugEnabled {
@@ -66,16 +99,14 @@ actor MoshEncryptedDatagramEndpoint: DatagramEndpoint {
     }
 
     private func decodeDatagram(_ data: Data) throws -> Data {
-        var cursor = 0
-        let directionalSequence = try data.readUInt64BE(cursor: &cursor)
-        let encryptedBody = Data(data[cursor...])
-
-        guard encryptedBody.count >= 16 else {
+        guard data.count >= 8 + 16 else {
             throw MoshWireError.truncated
         }
-
-        let ciphertext = Data(encryptedBody.dropLast(16))
-        let tag = Data(encryptedBody.suffix(16))
+        var cursor = 0
+        let directionalSequence = try data.readBigEndian(UInt64.self, cursor: &cursor)
+        let body = Data(data[cursor...])
+        let ciphertext = Data(body.dropLast(16))
+        let tag = Data(body.suffix(16))
         let nonce = OCBNonce.from(messageID: 0, sequence: directionalSequence)
         let plaintext = try cipher.open(ciphertext: ciphertext, nonce: nonce, tag: tag)
 
@@ -98,31 +129,5 @@ actor MoshEncryptedDatagramEndpoint: DatagramEndpoint {
             payload: payload
         )
         return MoshPacketCodec.encode(packet)
-    }
-}
-
-private extension Data {
-    mutating func appendUInt16BE(_ value: UInt16) {
-        append(UInt8((value >> 8) & 0xFF))
-        append(UInt8(value & 0xFF))
-    }
-
-    mutating func appendUInt64BE(_ value: UInt64) {
-        for shift in stride(from: 56, through: 0, by: -8) {
-            append(UInt8((value >> UInt64(shift)) & 0xFF))
-        }
-    }
-
-    func readUInt64BE(cursor: inout Int) throws -> UInt64 {
-        let size = MemoryLayout<UInt64>.size
-        guard cursor + size <= count else {
-            throw MoshWireError.truncated
-        }
-        var value: UInt64 = 0
-        for index in 0..<size {
-            value = (value << 8) | UInt64(self[cursor + index])
-        }
-        cursor += size
-        return value
     }
 }

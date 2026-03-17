@@ -367,8 +367,14 @@ public struct TransportReceivedPayload: Sendable, Hashable, Codable {
     }
 }
 
+public protocol TransportCipher: Sendable {
+    func seal(directionalSequence: UInt64, plaintext: Data) throws -> Data
+    func open(datagram: Data) throws -> (directionalSequence: UInt64, plaintext: Data)
+}
+
 public actor TransportEngine {
     private let endpoint: any DatagramEndpoint
+    private let cipher: (any TransportCipher)?
     private let outgoingDirection: MoshDirection
     private let mtu: Int
 
@@ -377,10 +383,11 @@ public actor TransportEngine {
     private var snapshot: TransportRuntimeSnapshot
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
 
-    public init(endpoint: any DatagramEndpoint, outgoingDirection: MoshDirection, mtu: Int = 1200) {
+    public init(endpoint: any DatagramEndpoint, outgoingDirection: MoshDirection, mtu: Int = 1200, cipher: (any TransportCipher)? = nil) {
         self.endpoint = endpoint
         self.outgoingDirection = outgoingDirection
         self.mtu = mtu
+        self.cipher = cipher
         self.fragmenter = MoshFragmenter()
         self.assembly = MoshFragmentAssembly()
         self.snapshot = TransportRuntimeSnapshot()
@@ -401,6 +408,12 @@ public actor TransportEngine {
         return value
     }
 
+    public func sendPayload(_ payload: Data) async throws {
+        let sequence = snapshot.nextOutgoingSequence
+        snapshot.nextOutgoingSequence &+= 1
+        try await sendPayload(payload, sequence: sequence)
+    }
+
     public func sendPayload(_ payload: Data, sequence: UInt64) async throws {
         let messageID = snapshot.nextInstructionID
         snapshot.nextInstructionID &+= 1
@@ -411,14 +424,25 @@ public actor TransportEngine {
 
         for index in fragments.indices {
             let fragment = fragments[index]
-            let packet = MoshPacket(
-                sequence: currentSequence,
-                direction: outgoingDirection,
-                timestamp: timestamp,
-                timestampReply: UInt16.max,
-                payload: fragment.encoded()
-            )
-            try await endpoint.send(MoshPacketCodec.encode(packet))
+            let dirSeq = MoshWire.directionalSequence(sequence: currentSequence, direction: outgoingDirection)
+
+            if let cipher {
+                var plaintext = Data()
+                plaintext.appendBigEndian(timestamp)
+                plaintext.appendBigEndian(UInt16.max)
+                plaintext.append(fragment.encoded())
+                let sealed = try cipher.seal(directionalSequence: dirSeq, plaintext: plaintext)
+                try await endpoint.send(sealed)
+            } else {
+                let packet = MoshPacket(
+                    sequence: currentSequence,
+                    direction: outgoingDirection,
+                    timestamp: timestamp,
+                    timestampReply: UInt16.max,
+                    payload: fragment.encoded()
+                )
+                try await endpoint.send(MoshPacketCodec.encode(packet))
+            }
 
             if index != fragments.index(before: fragments.endIndex) {
                 currentSequence = snapshot.nextOutgoingSequence
@@ -434,7 +458,18 @@ public actor TransportEngine {
             let datagram = try await endpoint.receive()
             snapshot.lastReceivedAtMs = datagram.receivedAtMs
 
-            let packet = try MoshPacketCodec.decode(datagram.data)
+            let packet: MoshPacket
+            if let cipher {
+                let (dirSeq, plaintext) = try cipher.open(datagram: datagram.data)
+                let (seq, dir) = MoshWire.splitDirectionalSequence(dirSeq)
+                guard plaintext.count >= 4 else { throw TransportError.malformedDatagram }
+                let ts = (UInt16(plaintext[0]) << 8) | UInt16(plaintext[1])
+                let tsr = (UInt16(plaintext[2]) << 8) | UInt16(plaintext[3])
+                packet = MoshPacket(sequence: seq, direction: dir, timestamp: ts, timestampReply: tsr, payload: Data(plaintext.dropFirst(4)))
+            } else {
+                packet = try MoshPacketCodec.decode(datagram.data)
+            }
+
             if debugEnabled {
                 debugLog("recv packet seq=\(packet.sequence) dir=\(packet.direction) payload=\(packet.payload.count)")
             }

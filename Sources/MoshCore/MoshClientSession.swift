@@ -107,14 +107,8 @@ public actor MoshClientSession {
             let key = try MoshBase64Key(printableKey: endpoint.keyBase64_22)
 
             let endpointImpl = endpointFactory(endpoint, config)
-            let runtimeEndpoint: any DatagramEndpoint
-            if config.useNetworkCrypto {
-                runtimeEndpoint = try MoshEncryptedDatagramEndpoint(wrapping: endpointImpl, key: key.raw)
-            } else {
-                runtimeEndpoint = endpointImpl
-            }
-
-            let engine = TransportEngine(endpoint: runtimeEndpoint, outgoingDirection: .toServer, mtu: config.mtu)
+            let cipher: OCBTransportCipher? = config.useNetworkCrypto ? try OCBTransportCipher(key: key.raw) : nil
+            let engine = TransportEngine(endpoint: endpointImpl, outgoingDirection: .toServer, mtu: config.mtu, cipher: cipher)
             try await engine.start()
 
             if let pendingTransportSnapshot {
@@ -734,8 +728,7 @@ public actor MoshClientSession {
         guard let engine else {
             throw MoshSessionError.notStarted
         }
-        let sequence = await engine.reserveOutgoingSequence()
-        try await engine.sendPayload(payload, sequence: sequence)
+        try await engine.sendPayload(payload)
         lastOutboundAtMs = TransportClock.nowMs()
     }
 
