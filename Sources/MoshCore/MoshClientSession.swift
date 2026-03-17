@@ -305,6 +305,10 @@ public actor MoshClientSession {
             if !hostOps.isEmpty {
                 publishHostOps(hostOps)
             }
+
+            if ackDirtyAtMs != nil, latestReceivedStateNum > lastAckReportedNum {
+                try? await sendAckOnly(nowMs: TransportClock.nowMs())
+            }
         } catch {
             if Task.isCancelled || state == .stopping || state == .stopped {
                 return false
