@@ -328,6 +328,85 @@ final class MoshPayloadEncoder: ChannelOutboundHandler {
     }
 }
 
+// MARK: - Throttle Handler
+
+final class MoshThrottleHandler: ChannelOutboundHandler {
+    typealias OutboundIn = TransportInstruction
+    typealias OutboundOut = TransportInstruction
+
+    private var lastUserSendAtMs: UInt64 = 0
+    private var writeQueue: [(NIOAny, EventLoopPromise<Void>?)] = []
+    private var scheduledWrite: Scheduled<Void>?
+    private let debugEnabled: Bool
+
+    init() {
+        self.debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        scheduledWrite?.cancel()
+        for (_, promise) in writeQueue {
+            promise?.fail(MoshSessionError.notStarted)
+        }
+        writeQueue.removeAll()
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        let instruction = unwrapOutboundIn(data)
+        guard let sessionContext = context.channel.moshContext else {
+            context.write(data, promise: promise)
+            return
+        }
+        guard sessionContext.config.sendMinDelayMs > 0, instruction.diff != nil else {
+            context.write(data, promise: promise)
+            return
+        }
+
+        writeQueue.append((data, promise))
+        guard scheduledWrite == nil else { return }
+
+        let now = TransportClock.nowMs()
+        if lastUserSendAtMs > 0 {
+            let elapsed = now >= lastUserSendAtMs ? now - lastUserSendAtMs : 0
+            if elapsed < UInt64(sessionContext.config.sendMinDelayMs) {
+                let delayMs = UInt64(sessionContext.config.sendMinDelayMs) - elapsed
+                scheduledWrite = context.eventLoop.scheduleTask(in: .milliseconds(Int64(delayMs))) { [self] in
+                    self.flushQueue(context: context)
+                }
+                return
+            }
+        }
+        flushQueue(context: context)
+    }
+
+    private func flushQueue(context: ChannelHandlerContext) {
+        scheduledWrite = nil
+        guard !writeQueue.isEmpty else { return }
+        guard let sessionContext = context.channel.moshContext else {
+            for (_, promise) in writeQueue {
+                promise?.fail(MoshSessionError.notStarted)
+            }
+            writeQueue.removeAll()
+            return
+        }
+
+        let (data, promise) = writeQueue.removeFirst()
+        lastUserSendAtMs = TransportClock.nowMs()
+        context.write(data, promise: promise)
+
+        if !writeQueue.isEmpty {
+            let delayMs = Int64(sessionContext.config.sendMinDelayMs)
+            scheduledWrite = context.eventLoop.scheduleTask(in: .milliseconds(delayMs)) { [self] in
+                self.flushQueue(context: context)
+            }
+        }
+    }
+
+    private func debugLog(_ message: String) {
+        FileHandle.standardError.write(Data("[MoshThrottleHandler] \(message)\n".utf8))
+    }
+}
+
 // MARK: - Protocol Handler
 
 final class MoshProtocolHandler: ChannelDuplexHandler {
@@ -338,14 +417,28 @@ final class MoshProtocolHandler: ChannelDuplexHandler {
 
     private let debugEnabled: Bool
     private var ackTimer: Scheduled<Void>?
+    private var heartbeatTimer: Scheduled<Void>?
+    private var ackIntervalTimer: Scheduled<Void>?
+    private var lastAckSentAtMs: UInt64 = 0
+    private var lastAckReportedNum: UInt64 = 0
+    private var ackDirtyAtMs: UInt64?
 
     init() {
         self.debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
     }
 
+    func channelActive(context: ChannelHandlerContext) {
+        scheduleHeartbeat(context: context)
+        scheduleAckInterval(context: context)
+    }
+
     func handlerRemoved(context: ChannelHandlerContext) {
         ackTimer?.cancel()
+        heartbeatTimer?.cancel()
+        ackIntervalTimer?.cancel()
         ackTimer = nil
+        heartbeatTimer = nil
+        ackIntervalTimer = nil
     }
 
     func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
@@ -369,6 +462,7 @@ final class MoshProtocolHandler: ChannelDuplexHandler {
             sessionContext.enqueuePendingOutbound(pending)
         }
 
+        sessionContext.recordSent()
         context.write(wrapOutboundOut(instruction), promise: promise)
     }
 
@@ -413,6 +507,7 @@ final class MoshProtocolHandler: ChannelDuplexHandler {
                 return []
             }
             sessionContext.applyRemoteStateNum(newNum)
+            ackDirtyAtMs = TransportClock.nowMs()
             scheduleAck(context: context, sessionContext: sessionContext)
         }
 
@@ -465,13 +560,149 @@ final class MoshProtocolHandler: ChannelDuplexHandler {
         )
         context.write(wrapOutboundOut(instruction), promise: nil)
         context.flush()
+        lastAckSentAtMs = TransportClock.nowMs()
+        lastAckReportedNum = latestReceived
+        ackDirtyAtMs = nil
         if debugEnabled {
             debugLog("auto-ack latestReceived=\(latestReceived)")
         }
     }
 
+    private func scheduleHeartbeat(context: ChannelHandlerContext) {
+        guard let sessionContext = context.channel.moshContext else { return }
+        let interval = Int64(sessionContext.config.heartbeatIntervalMs)
+        heartbeatTimer = context.eventLoop.scheduleTask(in: .milliseconds(interval)) { [self] in
+            self.sendHeartbeatIfNeeded(context: context)
+            self.scheduleHeartbeat(context: context)
+        }
+    }
+
+    private func sendHeartbeatIfNeeded(context: ChannelHandlerContext) {
+        guard let sessionContext = context.channel.moshContext else { return }
+        let now = TransportClock.nowMs()
+        let lastOutbound = sessionContext.lastSentAtMs ?? 0
+        guard now >= lastOutbound && now - lastOutbound >= UInt64(sessionContext.config.heartbeatIntervalMs) else { return }
+
+        let lastSent = sessionContext.lastSentStateNum
+        let latestReceived = sessionContext.latestReceivedStateNum
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: lastSent,
+            newNum: lastSent,
+            ackNum: latestReceived,
+            throwawayNum: sessionContext.pendingOutboundStateNums().first ?? 0,
+            diff: nil,
+            chaff: Data()
+        )
+        context.write(wrapOutboundOut(instruction), promise: nil)
+        context.flush()
+        sessionContext.recordSent()
+        lastAckSentAtMs = now
+        lastAckReportedNum = latestReceived
+        ackDirtyAtMs = nil
+        if debugEnabled {
+            debugLog("heartbeat lastSent=\(lastSent) latestReceived=\(latestReceived)")
+        }
+    }
+
+    private func scheduleAckInterval(context: ChannelHandlerContext) {
+        guard let sessionContext = context.channel.moshContext else { return }
+        let interval = Int64(sessionContext.config.ackIntervalMs)
+        ackIntervalTimer = context.eventLoop.scheduleTask(in: .milliseconds(interval)) { [self] in
+            self.sendIntervalAckIfNeeded(context: context)
+            self.scheduleAckInterval(context: context)
+        }
+    }
+
+    private func sendIntervalAckIfNeeded(context: ChannelHandlerContext) {
+        guard let sessionContext = context.channel.moshContext else { return }
+        let now = TransportClock.nowMs()
+        let latestReceived = sessionContext.latestReceivedStateNum
+
+        guard latestReceived > lastAckReportedNum else { return }
+        guard now >= lastAckSentAtMs && now - lastAckSentAtMs >= UInt64(sessionContext.config.ackIntervalMs) else { return }
+
+        let lastSent = sessionContext.lastSentStateNum
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: lastSent,
+            newNum: lastSent,
+            ackNum: latestReceived,
+            throwawayNum: sessionContext.pendingOutboundStateNums().first ?? 0,
+            diff: nil,
+            chaff: Data()
+        )
+        context.write(wrapOutboundOut(instruction), promise: nil)
+        context.flush()
+        lastAckSentAtMs = now
+        lastAckReportedNum = latestReceived
+        ackDirtyAtMs = nil
+        if debugEnabled {
+            debugLog("interval-ack latestReceived=\(latestReceived)")
+        }
+    }
+
     private func debugLog(_ message: String) {
         FileHandle.standardError.write(Data("[MoshProtocolHandler] \(message)\n".utf8))
+    }
+}
+
+// MARK: - Retransmit Handler
+
+final class MoshRetransmitHandler: ChannelInboundHandler {
+    typealias InboundIn = [MoshHostOp]
+
+    private var retransmitTimer: Scheduled<Void>?
+    private let debugEnabled: Bool
+
+    init() {
+        self.debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        scheduleRetransmit(context: context)
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        retransmitTimer?.cancel()
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        context.fireChannelRead(data)
+    }
+
+    private func scheduleRetransmit(context: ChannelHandlerContext) {
+        retransmitTimer = context.eventLoop.scheduleTask(in: .milliseconds(50)) { [self] in
+            self.processRetransmitQueue(context: context)
+            self.scheduleRetransmit(context: context)
+        }
+    }
+
+    private func processRetransmitQueue(context: ChannelHandlerContext) {
+        guard let sessionContext = context.channel.moshContext else { return }
+        let nowMs = TransportClock.nowMs()
+        while let pending = sessionContext.peekNextRetransmit(nowMs: nowMs) {
+            if pending.retryCount >= sessionContext.config.maxRetransmitCount {
+                context.fireErrorCaught(SessionRuntimeError.fatal(
+                    .retryLimitExceeded(stateNum: pending.stateNum, retryCount: pending.retryCount)
+                ))
+                return
+            }
+            context.write(NIOAny(pending.instruction), promise: nil)
+            let nextRetry = nowMs &+ UInt64(sessionContext.currentRtoClampedMs())
+            sessionContext.recordRetransmit(stateNum: pending.stateNum, nowMs: nowMs, nextRetryAtMs: nextRetry)
+        }
+        context.flush()
+        if debugEnabled {
+            let count = sessionContext.pendingOutboundCount()
+            if count > 0 {
+                debugLog("retransmit check: \(count) pending")
+            }
+        }
+    }
+
+    private func debugLog(_ message: String) {
+        FileHandle.standardError.write(Data("[MoshRetransmitHandler] \(message)\n".utf8))
     }
 }
 
