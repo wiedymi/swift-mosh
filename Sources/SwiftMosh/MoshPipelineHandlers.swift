@@ -194,10 +194,8 @@ final class MoshFrameEncoder: ChannelOutboundHandler {
     typealias OutboundIn = ByteBuffer
     typealias OutboundOut = MoshPacket
 
-    private var nextInstructionID: UInt64 = 0
     private let mtu: Int
     private let outgoingDirection: MoshDirection
-    private var nextOutgoingSequence: UInt64 = 0
     private let debugEnabled: Bool
 
     init(mtu: Int, outgoingDirection: MoshDirection) {
@@ -213,8 +211,12 @@ final class MoshFrameEncoder: ChannelOutboundHandler {
             return
         }
 
-        let messageID = nextInstructionID
-        nextInstructionID &+= 1
+        guard let sessionContext = context.channel.moshContext else {
+            promise?.fail(MoshSessionError.notStarted)
+            return
+        }
+
+        let messageID = sessionContext.reserveInstructionID()
 
         do {
             let fragments = try MoshFragmenter().makeFragments(
@@ -236,13 +238,12 @@ final class MoshFrameEncoder: ChannelOutboundHandler {
 
             for (index, fragment) in fragments.enumerated() {
                 let packet = MoshPacket(
-                    sequence: nextOutgoingSequence,
+                    sequence: sessionContext.reserveOutgoingSequence(),
                     direction: outgoingDirection,
                     timestamp: timestamp,
                     timestampReply: UInt16.max,
                     payload: fragment.encoded()
                 )
-                nextOutgoingSequence &+= 1
 
                 let p = (index == fragments.count - 1) ? subPromise : nil
                 context.write(wrapOutboundOut(packet), promise: p)
@@ -250,7 +251,8 @@ final class MoshFrameEncoder: ChannelOutboundHandler {
             context.flush()
 
             if debugEnabled {
-                debugLog("sent \(fragments.count) fragments, nextSeq=\(nextOutgoingSequence)")
+                let nextSeq = sessionContext.nextOutgoingSequence
+                debugLog("sent \(fragments.count) fragments, nextSeq=\(nextSeq)")
             }
         } catch {
             promise?.fail(error)
@@ -326,19 +328,178 @@ final class MoshPayloadEncoder: ChannelOutboundHandler {
     }
 }
 
-// MARK: - Delivery Handler
+// MARK: - Protocol Handler
 
-final class MoshDeliveryHandler: ChannelInboundHandler {
+final class MoshProtocolHandler: ChannelDuplexHandler {
     typealias InboundIn = MoshInboundEnvelope
+    typealias InboundOut = [MoshHostOp]
+    typealias OutboundIn = TransportInstruction
+    typealias OutboundOut = TransportInstruction
 
-    private let onEnvelope: @Sendable (MoshInboundEnvelope) -> Void
+    private let debugEnabled: Bool
+    private var ackTimer: Scheduled<Void>?
 
-    init(onEnvelope: @escaping @Sendable (MoshInboundEnvelope) -> Void) {
-        self.onEnvelope = onEnvelope
+    init() {
+        self.debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        ackTimer?.cancel()
+        ackTimer = nil
+    }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        let instruction = unwrapOutboundIn(data)
+
+        guard let sessionContext = context.channel.moshContext else {
+            promise?.fail(MoshSessionError.notStarted)
+            return
+        }
+
+        if let newNum = instruction.newNum, newNum > sessionContext.lastSentStateNum {
+            sessionContext.updateLastSentStateNum(newNum)
+            let now = TransportClock.nowMs()
+            let pending = PendingOutboundInstruction(
+                stateNum: newNum,
+                instruction: instruction,
+                retryCount: 0,
+                lastSentAtMs: now,
+                nextRetryAtMs: now &+ UInt64(sessionContext.currentRtoClampedMs())
+            )
+            sessionContext.enqueuePendingOutbound(pending)
+        }
+
+        context.write(wrapOutboundOut(instruction), promise: promise)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let envelope = unwrapInboundIn(data)
-        onEnvelope(envelope)
+
+        guard let sessionContext = context.channel.moshContext else {
+            context.fireChannelRead(wrapInboundOut([MoshHostOp]()))
+            return
+        }
+
+        do {
+            let hostOps = try processInbound(envelope, context: context, sessionContext: sessionContext)
+            context.fireChannelRead(wrapInboundOut(hostOps))
+        } catch {
+            context.fireErrorCaught(error)
+        }
+    }
+
+    private func processInbound(_ envelope: MoshInboundEnvelope, context: ChannelHandlerContext, sessionContext: MoshSessionContext) throws -> [MoshHostOp] {
+        let instruction = envelope.instruction
+
+        sessionContext.recordReceived()
+        updateRtt(timestampReply: envelope.timestampReply, sessionContext: sessionContext)
+
+        if let version = instruction.protocolVersion, version != MoshWire.protocolVersion {
+            throw SessionRuntimeError.fatal(.protocolViolation("mosh protocol mismatch: got \(version)"))
+        }
+
+        if let ack = instruction.ackNum {
+            sessionContext.acknowledgePendingOutbound(through: ack)
+        }
+        if let throwaway = instruction.throwawayNum, throwaway > 0 {
+            sessionContext.pruneAppliedRemoteStates(before: throwaway)
+        }
+
+        if let newNum = instruction.newNum {
+            if sessionContext.isStateAlreadyApplied(newNum) {
+                return []
+            }
+            if let oldNum = instruction.oldNum, sessionContext.isOldNumTooFarAhead(oldNum) {
+                return []
+            }
+            sessionContext.applyRemoteStateNum(newNum)
+            scheduleAck(context: context, sessionContext: sessionContext)
+        }
+
+        guard let diff = instruction.diff else {
+            return []
+        }
+
+        if let hostMessage = try? HostMessage(decoding: diff), !hostMessage.instructions.isEmpty {
+            return hostMessage.instructions.map { instr in
+                switch instr {
+                case .hostBytes(let bytes):
+                    return .hostBytes(bytes)
+                case .resize(let width, let height):
+                    return .resize(cols: width, rows: height)
+                case .echoAck(let value):
+                    return .echoAck(value)
+                }
+            }
+        }
+
+        return [.hostBytes(diff)]
+    }
+
+    private func updateRtt(timestampReply: UInt16, sessionContext: MoshSessionContext) {
+        guard timestampReply != UInt16.max else { return }
+        let now16 = MoshWire.timestamp16(nowMilliseconds: TransportClock.nowMs())
+        let sample = Double(MoshWire.timestampDiff(new: now16, old: timestampReply))
+        sessionContext.applyRttSample(sample)
+    }
+
+    private func scheduleAck(context: ChannelHandlerContext, sessionContext: MoshSessionContext) {
+        ackTimer?.cancel()
+        let delayMs = Int64(sessionContext.config.ackDelayMs)
+        ackTimer = context.eventLoop.scheduleTask(in: .milliseconds(delayMs)) { [self] in
+            self.flushAck(context: context, sessionContext: sessionContext)
+        }
+    }
+
+    private func flushAck(context: ChannelHandlerContext, sessionContext: MoshSessionContext) {
+        let lastSent = sessionContext.lastSentStateNum
+        let latestReceived = sessionContext.latestReceivedStateNum
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: lastSent,
+            newNum: lastSent,
+            ackNum: latestReceived,
+            throwawayNum: sessionContext.pendingOutboundStateNums().first ?? 0,
+            diff: nil,
+            chaff: Data()
+        )
+        context.write(wrapOutboundOut(instruction), promise: nil)
+        context.flush()
+        if debugEnabled {
+            debugLog("auto-ack latestReceived=\(latestReceived)")
+        }
+    }
+
+    private func debugLog(_ message: String) {
+        FileHandle.standardError.write(Data("[MoshProtocolHandler] \(message)\n".utf8))
+    }
+}
+
+// MARK: - Session Event
+
+public enum MoshSessionEvent: Sendable {
+    case hostOps([MoshHostOp])
+    case error(Error)
+}
+
+// MARK: - Event Handler
+
+final class MoshEventHandler: ChannelInboundHandler {
+    typealias InboundIn = [MoshHostOp]
+
+    private let onEvent: @Sendable (MoshSessionEvent) -> Void
+
+    init(onEvent: @escaping @Sendable (MoshSessionEvent) -> Void) {
+        self.onEvent = onEvent
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let hostOps = unwrapInboundIn(data)
+        onEvent(.hostOps(hostOps))
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        onEvent(.error(error))
+        context.close(promise: nil)
     }
 }

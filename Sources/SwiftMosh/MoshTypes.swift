@@ -96,6 +96,7 @@ public enum MoshSessionError: Error, Sendable {
 struct SessionStateBlob: Sendable, Codable, Hashable {
     var config: MoshClientConfig
     var pendingHostOps: [MoshHostOp]
+    var transportSnapshot: MoshSessionContextSnapshot
 }
 
 public enum MoshSessionState: Sendable, Hashable, Codable {
