@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import MoshBootstrap
+@testable import SwiftMosh
 
 final class MoshBootstrapTests: XCTestCase {
     func testParseNoisyOutputWithPID() throws {

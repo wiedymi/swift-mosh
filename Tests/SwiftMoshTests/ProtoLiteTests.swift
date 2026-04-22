@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import MoshProtoLite
+@testable import SwiftMosh
 
 final class ProtoLiteTests: XCTestCase {
     func testTransportInstructionRoundTripAndUnknownSkipping() throws {

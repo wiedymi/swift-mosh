@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import MoshWire
+@testable import SwiftMosh
 
 final class WirePrimitivesTests: XCTestCase {
     func testTimestampDirectionalSequenceAndPacketRoundTrip() throws {

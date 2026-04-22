@@ -1,11 +1,6 @@
 import Foundation
 import XCTest
-@testable import MoshCompression
-@testable import MoshCore
-@testable import MoshCryptoOCB
-@testable import MoshProtoLite
-@testable import MoshTransport
-@testable import MoshWire
+@testable import SwiftMosh
 
 final class CoreAndAdapterTests: XCTestCase {
     func testConfigAndBasicCodableTypes() throws {

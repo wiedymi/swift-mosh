@@ -8,45 +8,21 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .library(name: "MoshCore", targets: ["MoshCore"]),
-        .library(name: "MoshTransport", targets: ["MoshTransport"]),
-        .library(name: "MoshWire", targets: ["MoshWire"]),
-        .library(name: "MoshProtoLite", targets: ["MoshProtoLite"]),
-        .library(name: "MoshCryptoOCB", targets: ["MoshCryptoOCB"]),
-        .library(name: "MoshCompression", targets: ["MoshCompression"]),
-        .library(name: "MoshBootstrap", targets: ["MoshBootstrap"])
+        .library(name: "SwiftMosh", targets: ["SwiftMosh"])
+    ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.58.0")
     ],
     targets: [
-        .target(name: "MoshWire"),
-        .target(name: "MoshProtoLite"),
-        .target(name: "MoshCryptoOCB"),
-        .target(name: "MoshCompression"),
-        .target(name: "MoshBootstrap"),
         .target(
-            name: "MoshTransport",
-            dependencies: ["MoshWire"]
-        ),
-        .target(
-            name: "MoshCore",
+            name: "SwiftMosh",
             dependencies: [
-                "MoshWire",
-                "MoshTransport",
-                "MoshProtoLite",
-                "MoshCryptoOCB",
-                "MoshCompression"
+                .product(name: "NIO", package: "swift-nio")
             ]
         ),
         .testTarget(
             name: "SwiftMoshTests",
-            dependencies: [
-                "MoshCore",
-                "MoshTransport",
-                "MoshWire",
-                "MoshProtoLite",
-                "MoshCryptoOCB",
-                "MoshCompression",
-                "MoshBootstrap"
-            ],
+            dependencies: ["SwiftMosh"],
             path: "Tests/SwiftMoshTests"
         )
     ]

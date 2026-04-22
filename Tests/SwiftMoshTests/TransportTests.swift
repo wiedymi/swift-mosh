@@ -1,9 +1,11 @@
 import Foundation
+#if canImport(Darwin)
 import Darwin
-import Network
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import XCTest
-@testable import MoshTransport
-@testable import MoshWire
+@testable import SwiftMosh
 
 final class TransportTests: XCTestCase {
     func testTransportClockAndAddressCodableHashable() throws {
@@ -88,8 +90,8 @@ final class TransportTests: XCTestCase {
         }
     }
 
-    func testNetworkEndpointPreStartAndInvalidPort() async {
-        let endpoint = NetworkDatagramEndpoint(remote: .init(host: "127.0.0.1", port: 9999))
+    func testNIOEndpointPreStart() async {
+        let endpoint = NIODatagramEndpoint(remote: .init(host: "127.0.0.1", port: 9999))
 
         do {
             try await endpoint.send(Data([1]))
@@ -109,20 +111,10 @@ final class TransportTests: XCTestCase {
             }
         }
 
-        let invalidPort = NetworkDatagramEndpoint(remote: .init(host: "127.0.0.1", port: 0))
-        do {
-            try await invalidPort.start()
-            XCTFail("Expected invalidPort")
-        } catch {
-            guard case .invalidPort(0) = error as? TransportError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-
         await endpoint.stop()
     }
 
-    func testNetworkEndpointLoopbackAndAlreadyStartedAndStopCancellation() async throws {
+    func testNIOEndpointLoopbackAndAlreadyStartedAndStopCancellation() async throws {
         var portA = try reserveUDPPort()
         var portB = try reserveUDPPort()
         if portA == portB {
@@ -132,8 +124,8 @@ final class TransportTests: XCTestCase {
             portA = try reserveUDPPort()
         }
 
-        let endpointA = NetworkDatagramEndpoint(remote: .init(host: "127.0.0.1", port: portB), localPort: portA)
-        let endpointB = NetworkDatagramEndpoint(remote: .init(host: "127.0.0.1", port: portA), localPort: portB)
+        let endpointA = NIODatagramEndpoint(remote: .init(host: "127.0.0.1", port: portB), localPort: portA)
+        let endpointB = NIODatagramEndpoint(remote: .init(host: "127.0.0.1", port: portA), localPort: portB)
 
         try await endpointA.start()
         try await endpointB.start()
@@ -171,117 +163,6 @@ final class TransportTests: XCTestCase {
         }
 
         await endpointA.stop()
-    }
-
-    func testNetworkEndpointDeterministicSendReceiveAndStopCoverage() async throws {
-        let fake = FakeUDPConnection()
-        let endpoint = NetworkDatagramEndpoint(
-            remote: .init(host: "127.0.0.1", port: 60001),
-            connectionFactory: { _, _, _ in fake }
-        )
-
-        let startTask = Task { try await endpoint.start() }
-        let hasStateHandler = await waitUntil { fake.hasStateHandler }
-        XCTAssertTrue(hasStateHandler)
-        try? await Task.sleep(nanoseconds: 2_000_000)
-        fake.emitState(.ready)
-        try await startTask.value
-        let hasReceiveHandler = await waitUntil { fake.hasReceiveHandler }
-        XCTAssertTrue(hasReceiveHandler)
-
-        fake.emitReceive(content: Data([0xFA]), error: nil)
-        let didRearmReceive = await waitUntil { fake.receiveRegistrationCount >= 2 }
-        XCTAssertTrue(didRearmReceive)
-
-        let buffered = try await endpoint.receive()
-        XCTAssertEqual(buffered.data, Data([0xFA]))
-
-        fake.sendError = .posix(.ECONNABORTED)
-        do {
-            try await endpoint.send(Data([0x01]))
-            XCTFail("Expected sendFailure")
-        } catch {
-            guard case .sendFailure = error as? TransportError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-        fake.sendError = nil
-
-        let waitingOnError = Task { try await endpoint.receive() }
-        try? await Task.sleep(nanoseconds: 2_000_000)
-        fake.emitReceive(content: nil, error: .posix(.ECONNRESET))
-        do {
-            _ = try await waitingOnError.value
-            XCTFail("Expected networkFailure")
-        } catch {
-            guard case .networkFailure = error as? TransportError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-
-        fake.emitReceive(content: nil, error: nil)
-        try? await Task.sleep(nanoseconds: 2_000_000)
-
-        let waitingOnStop = Task { try await endpoint.receive() }
-        try? await Task.sleep(nanoseconds: 2_000_000)
-        await endpoint.stop()
-        do {
-            _ = try await waitingOnStop.value
-            XCTFail("Expected cancelled")
-        } catch {
-            guard case .cancelled = error as? TransportError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-
-        await endpoint._testArmReceiveLoop()
-    }
-
-    func testNetworkEndpointDeterministicStateFailureAndCancellationCoverage() async throws {
-        let failedConnection = FakeUDPConnection()
-        let failedEndpoint = NetworkDatagramEndpoint(
-            remote: .init(host: "127.0.0.1", port: 60002),
-            connectionFactory: { _, _, _ in failedConnection }
-        )
-
-        let failedStart = Task { try await failedEndpoint.start() }
-        let failedReady = await waitUntil { failedConnection.hasStateHandler && failedConnection.startCallCount > 0 }
-        XCTAssertTrue(failedReady)
-        try? await Task.sleep(nanoseconds: 2_000_000)
-        failedConnection.emitState(.failed(.posix(.ECONNREFUSED)))
-        do {
-            try await failedStart.value
-            XCTFail("Expected networkFailure")
-        } catch {
-            guard case .networkFailure = error as? TransportError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
-
-        let cancelledConnection = FakeUDPConnection()
-        let cancelledEndpoint = NetworkDatagramEndpoint(
-            remote: .init(host: "127.0.0.1", port: 60003),
-            connectionFactory: { _, _, _ in cancelledConnection }
-        )
-
-        let cancelledStart = Task { try await cancelledEndpoint.start() }
-        let cancelledReady = await waitUntil { cancelledConnection.hasStateHandler && cancelledConnection.startCallCount > 0 }
-        XCTAssertTrue(cancelledReady)
-        try? await Task.sleep(nanoseconds: 2_000_000)
-        cancelledConnection.emitState(.ready)
-        try await cancelledStart.value
-
-        let waitingReceive = Task { try await cancelledEndpoint.receive() }
-        try? await Task.sleep(nanoseconds: 2_000_000)
-        cancelledConnection.emitState(.cancelled)
-        do {
-            _ = try await waitingReceive.value
-            XCTFail("Expected cancelled")
-        } catch {
-            guard case .cancelled = error as? TransportError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-        }
     }
 
     func testTransportEngineSendReceiveSnapshotRestoreAndFiltering() async throws {
@@ -422,7 +303,9 @@ private func reserveUDPPort() throws -> UInt16 {
     defer { close(fd) }
 
     var address = sockaddr_in()
+    #if canImport(Darwin)
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    #endif
     address.sin_family = sa_family_t(AF_INET)
     address.sin_port = in_port_t(0).bigEndian
     address.sin_addr = in_addr(s_addr: INADDR_ANY.bigEndian)
@@ -501,91 +384,4 @@ private actor StubDatagramEndpoint: DatagramEndpoint {
     func isStopped() -> Bool {
         stopped
     }
-}
-
-private final class FakeUDPConnection: UDPConnection, @unchecked Sendable {
-    private let lock = NSLock()
-
-    private var _stateUpdateHandler: (@Sendable (NWConnection.State) -> Void)?
-    private var _receiveCompletion: (@Sendable (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void)?
-
-    private(set) var startCallCount: Int = 0
-    private(set) var receiveRegistrationCount: Int = 0
-    var sendError: NWError?
-
-    var hasStateHandler: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _stateUpdateHandler != nil
-    }
-
-    var hasReceiveHandler: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _receiveCompletion != nil
-    }
-
-    func setStateUpdateHandler(_ handler: (@Sendable (NWConnection.State) -> Void)?) {
-        lock.lock()
-        _stateUpdateHandler = handler
-        lock.unlock()
-    }
-
-    func start(queue: DispatchQueue) {
-        lock.lock()
-        startCallCount += 1
-        lock.unlock()
-    }
-
-    func cancel() {}
-
-    func send(content: Data?, completion: NWConnection.SendCompletion) {
-        let error: NWError?
-        lock.lock()
-        error = sendError
-        lock.unlock()
-
-        if case .contentProcessed(let callback) = completion {
-            callback(error)
-        }
-    }
-
-    func receiveMessage(completion: @escaping @Sendable (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void) {
-        lock.lock()
-        _receiveCompletion = completion
-        receiveRegistrationCount += 1
-        lock.unlock()
-    }
-
-    func emitState(_ state: NWConnection.State) {
-        let callback: (@Sendable (NWConnection.State) -> Void)?
-        lock.lock()
-        callback = _stateUpdateHandler
-        lock.unlock()
-        callback?(state)
-    }
-
-    func emitReceive(content: Data?, error: NWError?) {
-        let callback: (@Sendable (Data?, NWConnection.ContentContext?, Bool, NWError?) -> Void)?
-        lock.lock()
-        callback = _receiveCompletion
-        lock.unlock()
-        callback?(content, nil, true, error)
-    }
-}
-
-private func waitUntil(
-    timeoutNs: UInt64 = 1_000_000_000,
-    stepNs: UInt64 = 2_000_000,
-    condition: @escaping @Sendable () -> Bool
-) async -> Bool {
-    var waited: UInt64 = 0
-    while waited < timeoutNs {
-        if condition() {
-            return true
-        }
-        try? await Task.sleep(nanoseconds: stepNs)
-        waited += stepNs
-    }
-    return condition()
 }

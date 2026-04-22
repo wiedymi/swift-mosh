@@ -1,5 +1,4 @@
 import Foundation
-import MoshTransport
 
 public struct MoshEndpoint: Sendable, Hashable, Codable {
     public var host: String
@@ -96,7 +95,6 @@ public enum MoshSessionError: Error, Sendable {
 
 struct SessionStateBlob: Sendable, Codable, Hashable {
     var config: MoshClientConfig
-    var transport: TransportRuntimeSnapshot
     var pendingHostOps: [MoshHostOp]
 }
 

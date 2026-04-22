@@ -2,7 +2,7 @@ import Compression
 import Foundation
 import XCTest
 import zlib
-@testable import MoshCompression
+@testable import SwiftMosh
 
 final class CompressionAdapterTests: XCTestCase {
     func testCompressionRoundTripForAllAlgorithmsAndLargePayload() throws {

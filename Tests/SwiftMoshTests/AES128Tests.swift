@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import MoshCryptoOCB
+@testable import SwiftMosh
 
 final class AES128Tests: XCTestCase {
     func testAES128KnownVectorEncryptDecryptAndInternalBlockAPIs() throws {

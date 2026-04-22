@@ -1,8 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
-@testable import MoshBootstrap
-@testable import MoshCore
+@testable import SwiftMosh
 
 final class RealMoshServerE2ETests: XCTestCase {
     func testRealMoshServerRoundTrip() async throws {

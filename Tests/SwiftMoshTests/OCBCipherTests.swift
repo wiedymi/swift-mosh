@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import MoshCryptoOCB
+@testable import SwiftMosh
 
 final class OCBCipherTests: XCTestCase {
     func testNonceAndPrintableKeyUtilities() throws {
