@@ -87,7 +87,6 @@ public class MoshSessionContext: @unchecked Sendable {
     public private(set) var lastSentStateNum: UInt64 = 0
     public private(set) var latestReceivedStateNum: UInt64 = 0
     public private(set) var appliedRemoteStateNums: Set<UInt64> = []
-    public private(set) var isResuming: Bool = false
 
     // RTT state
     public private(set) var srttMs: Double?
@@ -181,19 +180,6 @@ public class MoshSessionContext: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         lastSentStateNum = stateNum
-    }
-
-    public func beginResume() {
-        lock.lock()
-        defer { lock.unlock() }
-        isResuming = true
-    }
-
-    public func endResume() {
-        lock.lock()
-        defer { lock.unlock() }
-        isResuming = false
-        appliedRemoteStateNums.removeAll()
     }
 
     // MARK: - RTT

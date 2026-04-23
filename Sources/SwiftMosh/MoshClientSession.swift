@@ -72,7 +72,6 @@ public actor MoshClientSession {
             }
             if let pendingTransportSnapshot {
                 context.restore(from: pendingTransportSnapshot)
-                context.beginResume()
                 self.pendingTransportSnapshot = nil
             }
             self.sessionContext = context
