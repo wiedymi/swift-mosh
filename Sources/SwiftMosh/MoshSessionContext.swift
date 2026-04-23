@@ -110,10 +110,7 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func reserveOutgoingSequence() -> UInt64 {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         let value = nextOutgoingSequence
         nextOutgoingSequence &+= 1
         return value
@@ -121,10 +118,7 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func reserveInstructionID() -> UInt64 {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         let value = nextInstructionID
         nextInstructionID &+= 1
         return value
@@ -134,28 +128,19 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func recordSent() {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         lastSentAtMs = TransportClock.nowMs()
     }
 
     public func recordReceived() {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         lastReceivedAtMs = TransportClock.nowMs()
     }
 
     public func advanceExpectedIncomingSequence(to sequence: UInt64) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         expectedIncomingSequence = sequence
     }
 
@@ -175,10 +160,7 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func applyRemoteStateNum(_ stateNum: UInt64) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         latestReceivedStateNum = max(latestReceivedStateNum, stateNum)
         appliedRemoteStateNums.insert(stateNum)
         if appliedRemoteStateNums.count > 4096 {
@@ -190,19 +172,13 @@ public class MoshSessionContext: @unchecked Sendable {
     public func pruneAppliedRemoteStates(before throwawayNum: UInt64) {
         guard throwawayNum > 0 else { return }
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= throwawayNum })
     }
 
     public func updateLastSentStateNum(_ stateNum: UInt64) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         lastSentStateNum = stateNum
     }
 
@@ -211,10 +187,7 @@ public class MoshSessionContext: @unchecked Sendable {
     public func applyRttSample(_ sample: Double) {
         guard sample > 0, sample < 5_000 else { return }
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
 
         if srttMs == nil {
             srttMs = sample
@@ -248,20 +221,14 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func enqueuePendingOutbound(_ pending: PendingOutboundInstruction) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         pendingOutbound[pending.stateNum] = pending
         pendingOutboundOrder.append(pending.stateNum)
     }
 
     public func acknowledgePendingOutbound(through ackNum: UInt64) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         let acknowledged = pendingOutboundOrder.filter { $0 <= ackNum }
         guard !acknowledged.isEmpty else { return }
         for stateNum in acknowledged {
@@ -283,10 +250,7 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func recordRetransmit(stateNum: UInt64, nowMs: UInt64, nextRetryAtMs: UInt64) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         guard var pending = pendingOutbound[stateNum] else { return }
         pending.retryCount &+= 1
         pending.lastSentAtMs = nowMs
@@ -330,10 +294,7 @@ public class MoshSessionContext: @unchecked Sendable {
 
     public func restore(from snapshot: MoshSessionContextSnapshot) {
         lock.lock()
-        defer {
-            lock.unlock()
-            didMutate()
-        }
+        defer { lock.unlock() }
         nextOutgoingSequence = snapshot.nextOutgoingSequence
         expectedIncomingSequence = snapshot.expectedIncomingSequence
         nextInstructionID = snapshot.nextInstructionID
