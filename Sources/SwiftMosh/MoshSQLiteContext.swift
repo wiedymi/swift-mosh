@@ -85,6 +85,8 @@ public final class MoshSQLiteSessionContext: MoshSessionContext {
             let msg = db != nil ? String(cString: sqlite3_errmsg(db)) : "unknown"
             fatalError("Failed to open SQLite database at \(dbPath): \(msg)")
         }
+        // WAL mode: reads don't block writes, writes don't block reads
+        sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
     }
 
     private func createSchemaIfNeeded() {
@@ -244,6 +246,9 @@ public final class MoshSQLiteSessionContext: MoshSessionContext {
     }
 
     private func syncFullSnapshotToDB(snapshot: MoshSessionContextSnapshot) {
+        beginTransaction()
+        defer { commitTransaction() }
+
         let now = TransportClock.nowMs()
         let metaSQL = """
             INSERT INTO mosh_session_meta (
@@ -399,5 +404,19 @@ public final class MoshSQLiteSessionContext: MoshSessionContext {
         while sqlite3_step(stmt) == SQLITE_ROW {
             rowHandler(stmt!)
         }
+    }
+
+    // MARK: - Transaction Control
+
+    private func beginTransaction() {
+        sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil)
+    }
+
+    private func commitTransaction() {
+        sqlite3_exec(db, "COMMIT;", nil, nil, nil)
+    }
+
+    private func rollbackTransaction() {
+        sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
     }
 }
