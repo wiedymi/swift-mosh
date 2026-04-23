@@ -503,8 +503,11 @@ final class MoshProtocolHandler: ChannelDuplexHandler {
             if sessionContext.isStateAlreadyApplied(newNum) {
                 return []
             }
-            if let oldNum = instruction.oldNum, sessionContext.isOldNumTooFarAhead(oldNum) {
+            if let oldNum = instruction.oldNum, sessionContext.isOldNumTooFarAhead(oldNum), !sessionContext.isResuming {
                 return []
+            }
+            if sessionContext.isResuming {
+                sessionContext.endResume()
             }
             sessionContext.applyRemoteStateNum(newNum)
             ackDirtyAtMs = TransportClock.nowMs()
