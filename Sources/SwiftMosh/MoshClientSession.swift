@@ -32,10 +32,12 @@ public actor MoshClientSession {
     private var inboundContinuation: AsyncStream<MoshSessionEvent>.Continuation?
 
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+    private let dbPath: String?
 
-    public init(endpoint: MoshEndpoint, config: MoshClientConfig = .init()) {
+    public init(endpoint: MoshEndpoint, config: MoshClientConfig = .init(), dbPath: String? = nil) {
         self.endpoint = endpoint
         self.config = config
+        self.dbPath = dbPath
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     }
 
@@ -59,7 +61,12 @@ public actor MoshClientSession {
             let (stream, continuation) = AsyncStream.makeStream(of: MoshSessionEvent.self)
             self.inboundContinuation = continuation
 
-            let context = MoshSessionContext(config: config)
+            let context: MoshSessionContext
+            if let dbPath {
+                context = MoshSQLiteSessionContext(config: config, dbPath: dbPath)
+            } else {
+                context = MoshSessionContext(config: config)
+            }
             if let pendingTransportSnapshot {
                 context.restore(from: pendingTransportSnapshot)
                 self.pendingTransportSnapshot = nil
@@ -181,7 +188,7 @@ public actor MoshClientSession {
         )
     }
 
-    public static func restore(from snapshot: MoshSnapshot, config: MoshClientConfig = .init()) async throws -> MoshClientSession {
+    public static func restore(from snapshot: MoshSnapshot, config: MoshClientConfig = .init(), dbPath: String? = nil) async throws -> MoshClientSession {
         guard snapshot.schemaVersion == 1 else {
             throw MoshSessionError.badSnapshotSchema(snapshot.schemaVersion)
         }
@@ -194,7 +201,7 @@ public actor MoshClientSession {
         }
 
         let effectiveConfig = config == MoshClientConfig() ? blob.config : config
-        let session = MoshClientSession(endpoint: snapshot.endpoint, config: effectiveConfig)
+        let session = MoshClientSession(endpoint: snapshot.endpoint, config: effectiveConfig, dbPath: dbPath)
         await session.install(pendingHostOps: blob.pendingHostOps, transportSnapshot: blob.transportSnapshot)
         return session
     }

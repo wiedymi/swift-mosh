@@ -65,7 +65,7 @@ public struct MoshSessionContextSnapshot: Sendable, Codable, Hashable {
 
 // MARK: - Context
 
-public struct PendingOutboundInstruction: Sendable {
+public struct PendingOutboundInstruction: Sendable, Codable {
     public var stateNum: UInt64
     public var instruction: TransportInstruction
     public var retryCount: UInt32
@@ -73,8 +73,8 @@ public struct PendingOutboundInstruction: Sendable {
     public var nextRetryAtMs: UInt64
 }
 
-public final class MoshSessionContext: @unchecked Sendable {
-    private let lock = NSLock()
+public class MoshSessionContext: @unchecked Sendable {
+    let lock = NSLock()
 
     // Transport sequence state
     public private(set) var nextOutgoingSequence: UInt64 = 0
@@ -104,11 +104,16 @@ public final class MoshSessionContext: @unchecked Sendable {
         self.currentRtoMs = Double(config.initialRtoMs)
     }
 
+    open func didMutate() {}
+
     // MARK: - Sequence Reservations
 
     public func reserveOutgoingSequence() -> UInt64 {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         let value = nextOutgoingSequence
         nextOutgoingSequence &+= 1
         return value
@@ -116,7 +121,10 @@ public final class MoshSessionContext: @unchecked Sendable {
 
     public func reserveInstructionID() -> UInt64 {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         let value = nextInstructionID
         nextInstructionID &+= 1
         return value
@@ -126,19 +134,28 @@ public final class MoshSessionContext: @unchecked Sendable {
 
     public func recordSent() {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         lastSentAtMs = TransportClock.nowMs()
     }
 
     public func recordReceived() {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         lastReceivedAtMs = TransportClock.nowMs()
     }
 
     public func advanceExpectedIncomingSequence(to sequence: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         expectedIncomingSequence = sequence
     }
 
@@ -158,7 +175,10 @@ public final class MoshSessionContext: @unchecked Sendable {
 
     public func applyRemoteStateNum(_ stateNum: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         latestReceivedStateNum = max(latestReceivedStateNum, stateNum)
         appliedRemoteStateNums.insert(stateNum)
         if appliedRemoteStateNums.count > 4096 {
@@ -170,13 +190,19 @@ public final class MoshSessionContext: @unchecked Sendable {
     public func pruneAppliedRemoteStates(before throwawayNum: UInt64) {
         guard throwawayNum > 0 else { return }
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= throwawayNum })
     }
 
     public func updateLastSentStateNum(_ stateNum: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         lastSentStateNum = stateNum
     }
 
@@ -185,7 +211,10 @@ public final class MoshSessionContext: @unchecked Sendable {
     public func applyRttSample(_ sample: Double) {
         guard sample > 0, sample < 5_000 else { return }
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
 
         if srttMs == nil {
             srttMs = sample
@@ -219,14 +248,20 @@ public final class MoshSessionContext: @unchecked Sendable {
 
     public func enqueuePendingOutbound(_ pending: PendingOutboundInstruction) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         pendingOutbound[pending.stateNum] = pending
         pendingOutboundOrder.append(pending.stateNum)
     }
 
     public func acknowledgePendingOutbound(through ackNum: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         let acknowledged = pendingOutboundOrder.filter { $0 <= ackNum }
         guard !acknowledged.isEmpty else { return }
         for stateNum in acknowledged {
@@ -248,7 +283,10 @@ public final class MoshSessionContext: @unchecked Sendable {
 
     public func recordRetransmit(stateNum: UInt64, nowMs: UInt64, nextRetryAtMs: UInt64) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         guard var pending = pendingOutbound[stateNum] else { return }
         pending.retryCount &+= 1
         pending.lastSentAtMs = nowMs
@@ -292,7 +330,10 @@ public final class MoshSessionContext: @unchecked Sendable {
 
     public func restore(from snapshot: MoshSessionContextSnapshot) {
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            didMutate()
+        }
         nextOutgoingSequence = snapshot.nextOutgoingSequence
         expectedIncomingSequence = snapshot.expectedIncomingSequence
         nextInstructionID = snapshot.nextInstructionID
