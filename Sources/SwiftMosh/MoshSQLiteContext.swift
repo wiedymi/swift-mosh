@@ -2,16 +2,18 @@ import Foundation
 import SQLite3
 
 public final class MoshSQLiteSessionContext: MoshSessionContext {
+    private let sessionID: String
     private let dbPath: String
     private var db: OpaquePointer?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(config: MoshClientConfig, dbPath: String) {
+    public init(sessionID: String, config: MoshClientConfig, dbPath: String) {
+        self.sessionID = sessionID
         self.dbPath = dbPath
         super.init(config: config)
         openDatabase()
-        createTable()
+        createTableIfNeeded()
         restoreIfPossible()
     }
 
@@ -34,10 +36,10 @@ public final class MoshSQLiteSessionContext: MoshSessionContext {
         }
     }
 
-    private func createTable() {
+    private func createTableIfNeeded() {
         let sql = """
             CREATE TABLE IF NOT EXISTS mosh_session_context (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
+                session_id TEXT PRIMARY KEY,
                 snapshot_json BLOB NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );
@@ -56,22 +58,27 @@ public final class MoshSQLiteSessionContext: MoshSessionContext {
         guard let data = try? encoder.encode(snapshot) else { return }
         let now = TransportClock.nowMs()
 
-        let sql = "INSERT OR REPLACE INTO mosh_session_context (id, snapshot_json, updated_at_ms) VALUES (1, ?, ?);"
+        let sql = "INSERT OR REPLACE INTO mosh_session_context (session_id, snapshot_json, updated_at_ms) VALUES (?, ?, ?);"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_blob(stmt, 1, (data as NSData).bytes, Int32(data.count), SQLITE_TRANSIENT)
-        sqlite3_bind_int64(stmt, 2, Int64(now))
+        let cSessionID = sessionID.cString(using: .utf8)
+        sqlite3_bind_text(stmt, 1, cSessionID, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_blob(stmt, 2, (data as NSData).bytes, Int32(data.count), SQLITE_TRANSIENT)
+        sqlite3_bind_int64(stmt, 3, Int64(now))
 
         sqlite3_step(stmt)
     }
 
     private func restoreIfPossible() {
-        let sql = "SELECT snapshot_json FROM mosh_session_context WHERE id = 1 LIMIT 1;"
+        let sql = "SELECT snapshot_json FROM mosh_session_context WHERE session_id = ? LIMIT 1;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
+
+        let cSessionID = sessionID.cString(using: .utf8)
+        sqlite3_bind_text(stmt, 1, cSessionID, -1, SQLITE_TRANSIENT)
 
         guard sqlite3_step(stmt) == SQLITE_ROW else { return }
         guard let blob = sqlite3_column_blob(stmt, 0) else { return }
