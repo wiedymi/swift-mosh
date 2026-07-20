@@ -39,7 +39,6 @@ public actor MoshClientSession {
     private var pendingOutbound: [UInt64: PendingOutboundInstruction] = [:]
     private var pendingOutboundOrder: [UInt64] = []
 
-    private var lastInboundAtMs: UInt64 = 0
     private var lastOutboundAtMs: UInt64 = 0
     private var lastStateSendAtMs: UInt64 = 0
 
@@ -54,7 +53,6 @@ public actor MoshClientSession {
     private var appliedRemoteStateNums: Set<UInt64> = []
 
     private var consecutiveReceiveFailures: UInt32 = 0
-    private let consecutiveFailureLimit: UInt32 = 8
 
     private var hostStreamContinuations: [UUID: AsyncStream<MoshHostOp>.Continuation] = [:]
 
@@ -104,11 +102,7 @@ public actor MoshClientSession {
         state = .starting
 
         do {
-            let key = try MoshBase64Key(printableKey: endpoint.keyBase64_22)
-
-            let endpointImpl = endpointFactory(endpoint, config)
-            let cipher: OCBTransportCipher? = config.useNetworkCrypto ? try OCBTransportCipher(key: key.raw) : nil
-            let engine = TransportEngine(endpoint: endpointImpl, outgoingDirection: .toServer, mtu: config.mtu, cipher: cipher)
+            let engine = try makeTransportEngine()
             try await engine.start()
 
             if let pendingTransportSnapshot {
@@ -118,7 +112,6 @@ public actor MoshClientSession {
 
             self.engine = engine
             let now = TransportClock.nowMs()
-            lastInboundAtMs = now
             lastOutboundAtMs = now
             lastStateSendAtMs = 0
             lastAckSentAtMs = now
@@ -256,31 +249,33 @@ public actor MoshClientSession {
 
     private func maintenanceLoop() async {
         while !Task.isCancelled {
-            guard case .running = state else {
-                return
-            }
-
-            let now = TransportClock.nowMs()
-            if now > lastInboundAtMs,
-               now - lastInboundAtMs > UInt64(config.networkTimeoutMs)
-            {
-                await failSession(.timeout(timeoutMs: config.networkTimeoutMs))
-                return
-            }
-
-            do {
-                try await processRetransmitQueue(nowMs: now)
-                try await maybeSendAck(nowMs: now)
-                try await maybeSendHeartbeat(nowMs: now)
-            } catch let SessionRuntimeError.fatal(failure) {
-                await failSession(failure)
-                return
-            } catch {
-                await failSession(.transportFailure("\(error)"))
-                return
-            }
+            guard await runMaintenanceLoopIteration() else { return }
 
             try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private func runMaintenanceLoopIteration() async -> Bool {
+        guard case .running = state else { return false }
+
+        let now = TransportClock.nowMs()
+        do {
+            try await processRetransmitQueue(nowMs: now)
+            try await maybeSendAck(nowMs: now)
+            try await maybeSendHeartbeat(nowMs: now)
+            return true
+        } catch let SessionRuntimeError.fatal(failure) {
+            await failSession(failure)
+            return false
+        } catch {
+            if !isRecoverableTransportError(error), engine != nil {
+                await failSession(.transportFailure("\(error)"))
+                return false
+            }
+            if debugEnabled {
+                debugLog("maintenance paused for transient transport error: \(error)")
+            }
+            return true
         }
     }
 
@@ -291,12 +286,12 @@ public actor MoshClientSession {
     }
 
     private func runReceiveLoopIteration() async -> Bool {
+        guard let engine else {
+            return state == .running && !Task.isCancelled
+        }
+
         do {
-            guard let engine else {
-                return false
-            }
             let incoming = try await engine.receivePayload()
-            lastInboundAtMs = TransportClock.nowMs()
             updateRtt(from: incoming)
 
             let hostOps = try decodeHostOps(from: incoming)
@@ -320,23 +315,69 @@ public actor MoshClientSession {
                 await failSession(reason)
                 return false
             case .transient(let delayMs, let message):
-                consecutiveReceiveFailures &+= 1
+                if consecutiveReceiveFailures < UInt32.max {
+                    consecutiveReceiveFailures += 1
+                }
                 if debugEnabled {
                     debugLog("transient receive error (\(consecutiveReceiveFailures)): \(message)")
                 }
-                if consecutiveReceiveFailures >= consecutiveFailureLimit {
-                    await failSession(
-                        .circuitBreakerTripped(
-                            consecutiveFailures: consecutiveReceiveFailures,
-                            message: message
-                        )
-                    )
-                    return false
-                }
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+                guard !Task.isCancelled, state == .running else { return false }
+                return await restartTransport(after: engine)
             }
         }
         return true
+    }
+
+    private func makeTransportEngine() throws -> TransportEngine {
+        let key = try MoshBase64Key(printableKey: endpoint.keyBase64_22)
+        let endpointImpl = endpointFactory(endpoint, config)
+        let cipher: OCBTransportCipher? = config.useNetworkCrypto
+            ? try OCBTransportCipher(key: key.raw)
+            : nil
+        return TransportEngine(
+            endpoint: endpointImpl,
+            outgoingDirection: .toServer,
+            mtu: config.mtu,
+            cipher: cipher
+        )
+    }
+
+    private func restartTransport(after failedEngine: TransportEngine) async -> Bool {
+        guard state == .running, engine === failedEngine else {
+            return state == .running && engine != nil
+        }
+
+        let snapshot = await failedEngine.makeSnapshot()
+        guard state == .running, engine === failedEngine else {
+            return state == .running && engine != nil
+        }
+
+        engine = nil
+        await failedEngine.stop()
+
+        var retryDelayMs: UInt64 = 50
+        while state == .running, !Task.isCancelled {
+            do {
+                let replacement = try makeTransportEngine()
+                try await replacement.start()
+                await replacement.restore(from: snapshot)
+                guard state == .running, !Task.isCancelled else {
+                    await replacement.stop()
+                    return false
+                }
+                engine = replacement
+                lastOutboundAtMs = TransportClock.nowMs()
+                return true
+            } catch {
+                if debugEnabled {
+                    debugLog("transport restart failed: \(error)")
+                }
+                try? await Task.sleep(nanoseconds: retryDelayMs * 1_000_000)
+                retryDelayMs = min(1_000, retryDelayMs * 2)
+            }
+        }
+        return false
     }
 
     func _testRunReceiveLoopIteration() async -> Bool {
@@ -471,7 +512,6 @@ public actor MoshClientSession {
 
     func _testSetStateForMaintenanceCoverage(
         state: MoshSessionState,
-        lastInboundAtMs: UInt64,
         lastOutboundAtMs: UInt64,
         lastAckSentAtMs: UInt64,
         latestReceivedStateNum: UInt64,
@@ -479,7 +519,6 @@ public actor MoshClientSession {
         ackDirtyAtMs: UInt64?
     ) {
         self.state = state
-        self.lastInboundAtMs = lastInboundAtMs
         self.lastOutboundAtMs = lastOutboundAtMs
         self.lastAckSentAtMs = lastAckSentAtMs
         self.latestReceivedStateNum = latestReceivedStateNum
@@ -489,7 +528,7 @@ public actor MoshClientSession {
     }
 
     func _testRunMaintenanceLoopForCoverage() async {
-        await maintenanceLoop()
+        _ = await runMaintenanceLoopIteration()
     }
 
     private func encodeUserDiff(from op: MoshClientOp) throws -> Data {
@@ -639,17 +678,10 @@ public actor MoshClientSession {
             guard var pending = pendingOutbound[stateNum] else { continue }
             guard nowMs >= pending.nextRetryAtMs else { continue }
 
-            if pending.retryCount >= config.maxRetransmitCount {
-                throw SessionRuntimeError.fatal(
-                    .retryLimitExceeded(
-                        stateNum: stateNum,
-                        retryCount: pending.retryCount
-                    )
-                )
-            }
-
             try await sendPayload(pending.payload)
-            pending.retryCount &+= 1
+            if pending.retryCount < config.maxRetransmitCount {
+                pending.retryCount += 1
+            }
             pending.lastSentAtMs = nowMs
             pending.nextRetryAtMs = nowMs &+ UInt64(currentRtoClampedMs())
             pendingOutbound[stateNum] = pending
@@ -813,9 +845,10 @@ public actor MoshClientSession {
             case .networkFailure(let message), .sendFailure(let message):
                 let delay = min(1_000, UInt64(50) << min(6, consecutiveReceiveFailures))
                 return .transient(delayMs: delay, message: message)
-            case .cancelled:
-                return .fatal(.transportFailure("cancelled"))
-            default:
+            case .cancelled, .notStarted:
+                let delay = min(1_000, UInt64(50) << min(6, consecutiveReceiveFailures))
+                return .transient(delayMs: delay, message: "\(transport)")
+            case .invalidPort, .alreadyStarted, .malformedDatagram:
                 return .fatal(.transportFailure("\(transport)"))
             }
         }
@@ -830,6 +863,16 @@ public actor MoshClientSession {
 
         let delay = min(1_000, UInt64(50) << min(6, consecutiveReceiveFailures))
         return .transient(delayMs: delay, message: "\(error)")
+    }
+
+    private func isRecoverableTransportError(_ error: Error) -> Bool {
+        guard let transport = error as? TransportError else { return false }
+        switch transport {
+        case .networkFailure, .sendFailure, .cancelled, .notStarted:
+            return true
+        case .invalidPort, .alreadyStarted, .malformedDatagram:
+            return false
+        }
     }
 
     private func debugLog(_ message: String) {

@@ -346,7 +346,7 @@ final class CoreAndAdapterTests: XCTestCase {
 
         // Cover classification branches.
         let cancelledClassification = await session._testClassifyReceiveError(TransportError.cancelled)
-        XCTAssertEqual(cancelledClassification, .transportFailure("cancelled"))
+        XCTAssertNil(cancelledClassification)
         let malformedClassification = await session._testClassifyReceiveError(TransportError.malformedDatagram)
         guard case .transportFailure = malformedClassification else {
             return XCTFail("Expected transportFailure for malformedDatagram")
@@ -447,7 +447,6 @@ final class CoreAndAdapterTests: XCTestCase {
         // Cover maintenanceLoop guard (!running) branch.
         await session._testSetStateForMaintenanceCoverage(
             state: .idle,
-            lastInboundAtMs: TransportClock.nowMs(),
             lastOutboundAtMs: TransportClock.nowMs(),
             lastAckSentAtMs: TransportClock.nowMs(),
             latestReceivedStateNum: 0,
@@ -459,7 +458,6 @@ final class CoreAndAdapterTests: XCTestCase {
         // Cover maintenanceLoop generic catch branch by forcing heartbeat send with nil engine.
         await session._testSetStateForMaintenanceCoverage(
             state: .running,
-            lastInboundAtMs: TransportClock.nowMs(),
             lastOutboundAtMs: 0,
             lastAckSentAtMs: TransportClock.nowMs(),
             latestReceivedStateNum: 0,
@@ -467,9 +465,8 @@ final class CoreAndAdapterTests: XCTestCase {
             ackDirtyAtMs: nil
         )
         await session._testRunMaintenanceLoopForCoverage()
-        guard case .failed(.transportFailure) = await session.state else {
-            return XCTFail("Expected maintenance generic catch to fail the session")
-        }
+        let stateAfterTransientMaintenanceError = await session.state
+        XCTAssertEqual(stateAfterTransientMaintenanceError, .running)
 
         // Cover maybeSendAck interval branch that emits an ack-only frame.
         let ackSession = MoshClientSession(
@@ -480,7 +477,6 @@ final class CoreAndAdapterTests: XCTestCase {
         )
         await ackSession._testSetStateForMaintenanceCoverage(
             state: .running,
-            lastInboundAtMs: TransportClock.nowMs(),
             lastOutboundAtMs: TransportClock.nowMs(),
             lastAckSentAtMs: 0,
             latestReceivedStateNum: 2,
@@ -633,7 +629,7 @@ final class CoreAndAdapterTests: XCTestCase {
         await server.stop()
     }
 
-    func testRetryLimitFailure() async throws {
+    func testRetransmitLimitDoesNotEndSession() async throws {
         var config = MoshClientConfig(
             sendMinDelayMs: 0,
             maxReceiveStates: 8,
@@ -656,38 +652,18 @@ final class CoreAndAdapterTests: XCTestCase {
         try await session.enqueue(.keystrokes(Data("x".utf8)))
         _ = try await receivePayloadEventually(engine: server, timeoutNs: 400_000_000) // initial send
         _ = try await receivePayloadEventually(engine: server, timeoutNs: 700_000_000) // one retry
+        try await Task.sleep(nanoseconds: 300_000_000)
 
-        guard let failure = await waitForFailure(session: session, timeoutNs: 1_200_000_000) else {
-            XCTFail("Expected retry limit failure")
-            await session.stop()
-            await server.stop()
-            return
-        }
-        guard case .retryLimitExceeded(let stateNum, let retryCount) = failure else {
-            XCTFail("Unexpected failure: \(failure)")
-            await session.stop()
-            await server.stop()
-            return
-        }
-        XCTAssertEqual(stateNum, 1)
-        XCTAssertEqual(retryCount, 1)
-
-        do {
-            try await session.enqueue(.keystrokes(Data("y".utf8)))
-            XCTFail("Expected sessionFailed after retry limit failure")
-        } catch {
-            guard case .sessionFailed(.retryLimitExceeded(let stateNum, let retryCount)) = error as? MoshSessionError else {
-                return XCTFail("Unexpected error: \(error)")
-            }
-            XCTAssertEqual(stateNum, 1)
-            XCTAssertEqual(retryCount, 1)
-        }
+        let state = await session.state
+        let pendingCount = await session._testPendingOutboundCount()
+        XCTAssertEqual(state, .running)
+        XCTAssertEqual(pendingCount, 1)
 
         await session.stop()
         await server.stop()
     }
 
-    func testTimeoutFailure() async throws {
+    func testNetworkSilenceDoesNotEndSession() async throws {
         var config = MoshClientConfig(
             sendMinDelayMs: 0,
             maxReceiveStates: 8,
@@ -707,26 +683,16 @@ final class CoreAndAdapterTests: XCTestCase {
         try await server.start()
         try await session.start()
 
-        guard let failure = await waitForFailure(session: session, timeoutNs: 1_500_000_000) else {
-            XCTFail("Expected timeout failure")
-            await session.stop()
-            await server.stop()
-            return
-        }
-        guard case .timeout(let timeoutMs) = failure else {
-            XCTFail("Unexpected failure: \(failure)")
-            await session.stop()
-            await server.stop()
-            return
-        }
-        XCTAssertEqual(timeoutMs, 500)
+        try await Task.sleep(nanoseconds: 900_000_000)
+        let state = await session.state
+        XCTAssertEqual(state, .running)
 
         await session.stop()
         await server.stop()
     }
 
-    func testCircuitBreakerTripping() async throws {
-        let failingEndpoint = AlwaysFailingReceiveEndpoint()
+    func testTransientReceiveFailuresRestartTransportWithoutEndingSession() async throws {
+        let recoveringEndpoint = RestartRecoveringEndpoint()
         let session = MoshClientSession(
             endpoint: makeEndpoint(),
             config: MoshClientConfig(
@@ -742,24 +708,22 @@ final class CoreAndAdapterTests: XCTestCase {
                 mtu: 256,
                 useNetworkCrypto: false
             ),
-            endpointFactory: { _, _ in failingEndpoint },
+            endpointFactory: { _, _ in recoveringEndpoint },
             snapshotEncoder: defaultSnapshotEncoder
         )
 
         try await session.start()
+        let restarted = await waitForEndpointStarts(
+            recoveringEndpoint,
+            expected: 2
+        )
+        XCTAssertTrue(restarted)
 
-        guard let failure = await waitForFailure(session: session, timeoutNs: 6_000_000_000) else {
-            XCTFail("Expected circuit-breaker failure")
-            await session.stop()
-            return
-        }
-        guard case .circuitBreakerTripped(let failures, let message) = failure else {
-            XCTFail("Unexpected failure: \(failure)")
-            await session.stop()
-            return
-        }
-        XCTAssertEqual(failures, 8)
-        XCTAssertTrue(message.contains("synthetic"))
+        try await session.enqueue(.keystrokes(Data("after-restart".utf8)))
+        let sendCount = await recoveringEndpoint.sendCount()
+        let state = await session.state
+        XCTAssertGreaterThan(sendCount, 0)
+        XCTAssertEqual(state, .running)
 
         await session.stop()
     }
@@ -1329,6 +1293,23 @@ final class CoreAndAdapterTests: XCTestCase {
         return await session._testPendingOutboundCount() == expected
     }
 
+    private func waitForEndpointStarts(
+        _ endpoint: RestartRecoveringEndpoint,
+        expected: Int,
+        timeoutNs: UInt64 = 1_000_000_000,
+        stepNs: UInt64 = 20_000_000
+    ) async -> Bool {
+        var waited: UInt64 = 0
+        while waited < timeoutNs {
+            if await endpoint.startCount() >= expected {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: stepNs)
+            waited += stepNs
+        }
+        return await endpoint.startCount() >= expected
+    }
+
     private func receivePayloadEventually(
         engine: TransportEngine,
         timeoutNs: UInt64
@@ -1411,6 +1392,53 @@ private actor AlwaysFailingReceiveEndpoint: DatagramEndpoint {
 
     func receiveAttempts() -> Int {
         receiveCount
+    }
+}
+
+private actor RestartRecoveringEndpoint: DatagramEndpoint {
+    private var started = false
+    private var starts = 0
+    private var sends = 0
+    private var didFailReceive = false
+    private var receiveContinuation: CheckedContinuation<TransportDatagram, Error>?
+
+    func start() async throws {
+        started = true
+        starts += 1
+    }
+
+    func stop() async {
+        started = false
+        receiveContinuation?.resume(throwing: TransportError.cancelled)
+        receiveContinuation = nil
+    }
+
+    func send(_ data: Data) async throws {
+        guard started else {
+            throw TransportError.notStarted
+        }
+        sends += 1
+    }
+
+    func receive() async throws -> TransportDatagram {
+        guard started else {
+            throw TransportError.notStarted
+        }
+        if !didFailReceive {
+            didFailReceive = true
+            throw TransportError.networkFailure("synthetic path loss")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            receiveContinuation = continuation
+        }
+    }
+
+    func startCount() -> Int {
+        starts
+    }
+
+    func sendCount() -> Int {
+        sends
     }
 }
 

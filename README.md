@@ -83,11 +83,11 @@ Reliability/lifecycle knobs are configurable in `MoshClientConfig`:
 - `sendMinDelayMs`
 - `ackIntervalMs`
 - `ackDelayMs`
-- `networkTimeoutMs`
+- `networkTimeoutMs` (retained for snapshot/source compatibility; network silence does not end a Mosh session)
 - `heartbeatIntervalMs`
 - `initialRtoMs`
 - `maxRtoMs`
-- `maxRetransmitCount`
+- `maxRetransmitCount` (caps retry bookkeeping; unacknowledged state remains pending)
 
 ## Running tests
 
