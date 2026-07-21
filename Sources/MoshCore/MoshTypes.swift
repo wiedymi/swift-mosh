@@ -62,7 +62,7 @@ public struct MoshSnapshot: Sendable, Hashable, Codable {
     public var createdAtMs: UInt64
     public var schemaVersion: UInt16
 
-    public init(endpoint: MoshEndpoint, transportState: Data, createdAtMs: UInt64, schemaVersion: UInt16 = 1) {
+    public init(endpoint: MoshEndpoint, transportState: Data, createdAtMs: UInt64, schemaVersion: UInt16 = 2) {
         self.endpoint = endpoint
         self.transportState = transportState
         self.createdAtMs = createdAtMs
@@ -98,12 +98,83 @@ struct SessionStateBlob: Sendable, Codable, Hashable {
     var config: MoshClientConfig
     var transport: TransportRuntimeSnapshot
     var pendingHostOps: [MoshHostOp]
+    var lastSentStateNum: UInt64
+    var latestReceivedStateNum: UInt64
+    var pendingOutbound: [PendingOutboundSnapshot]
+    var lastAckReportedNum: UInt64
+    var appliedRemoteStateNums: Set<UInt64>
+
+    init(
+        config: MoshClientConfig,
+        transport: TransportRuntimeSnapshot,
+        pendingHostOps: [MoshHostOp],
+        lastSentStateNum: UInt64,
+        latestReceivedStateNum: UInt64,
+        pendingOutbound: [PendingOutboundSnapshot],
+        lastAckReportedNum: UInt64,
+        appliedRemoteStateNums: Set<UInt64>
+    ) {
+        self.config = config
+        self.transport = transport
+        self.pendingHostOps = pendingHostOps
+        self.lastSentStateNum = lastSentStateNum
+        self.latestReceivedStateNum = latestReceivedStateNum
+        self.pendingOutbound = pendingOutbound
+        self.lastAckReportedNum = lastAckReportedNum
+        self.appliedRemoteStateNums = appliedRemoteStateNums
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case config
+        case transport
+        case pendingHostOps
+        case lastSentStateNum
+        case latestReceivedStateNum
+        case pendingOutbound
+        case lastAckReportedNum
+        case appliedRemoteStateNums
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        config = try container.decode(MoshClientConfig.self, forKey: .config)
+        transport = try container.decode(TransportRuntimeSnapshot.self, forKey: .transport)
+        pendingHostOps = try container.decode([MoshHostOp].self, forKey: .pendingHostOps)
+        lastSentStateNum = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .lastSentStateNum
+        ) ?? 0
+        latestReceivedStateNum = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .latestReceivedStateNum
+        ) ?? 0
+        pendingOutbound = try container.decodeIfPresent(
+            [PendingOutboundSnapshot].self,
+            forKey: .pendingOutbound
+        ) ?? []
+        lastAckReportedNum = try container.decodeIfPresent(
+            UInt64.self,
+            forKey: .lastAckReportedNum
+        ) ?? 0
+        appliedRemoteStateNums = try container.decodeIfPresent(
+            Set<UInt64>.self,
+            forKey: .appliedRemoteStateNums
+        ) ?? []
+    }
+}
+
+struct PendingOutboundSnapshot: Sendable, Codable, Hashable {
+    var stateNum: UInt64
+    var payload: Data
+    var retryCount: UInt32
 }
 
 public enum MoshSessionState: Sendable, Hashable, Codable {
     case idle
     case starting
     case running
+    case suspending
+    case suspended
     case stopping
     case stopped
     case failed(MoshSessionFailure)

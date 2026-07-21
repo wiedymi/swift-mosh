@@ -9,6 +9,89 @@ import XCTest
 
 final class MoshProtocolE2ETests: XCTestCase {
 
+    func testRepeatedColdRelaunchRestoresProtocolSession() async throws {
+        let (clientEnd, serverEnd) = await InMemoryDatagramPair.makeLinked()
+        let key = Data(repeating: 0x27, count: 16)
+        let endpoint = MoshEndpoint(
+            host: "127.0.0.1",
+            port: 60001,
+            keyBase64_22: try MoshBase64Key(raw: key).printable
+        )
+        var config = MoshClientConfig()
+        config.useNetworkCrypto = true
+        config.ackDelayMs = 5_000
+        config.ackIntervalMs = 5_000
+        config.heartbeatIntervalMs = 60_000
+
+        try await serverEnd.start()
+        let serverEngine = TransportEngine(
+            endpoint: serverEnd,
+            outgoingDirection: .toClient,
+            cipher: try OCBTransportCipher(key: key)
+        )
+
+        var session = MoshClientSession(
+            endpoint: endpoint,
+            config: config,
+            endpointFactory: { _, _ in clientEnd },
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+        )
+        try await session.start()
+
+        for cycle in UInt64(1)...3 {
+            try await session.enqueue(
+                .keystrokes(Data("client-\(cycle)".utf8))
+            )
+
+            let marker = "server-\(cycle)"
+            let hostMessage = HostMessage(
+                instructions: [.hostBytes(Data(marker.utf8))]
+            )
+            let instruction = TransportInstruction(
+                protocolVersion: MoshWire.protocolVersion,
+                oldNum: cycle - 1,
+                newNum: cycle,
+                ackNum: cycle,
+                throwawayNum: 0,
+                diff: hostMessage.encoded(),
+                chaff: Data()
+            )
+            let payload = try MoshCompressionCodec().compress(
+                instruction.encoded(),
+                algorithm: .zlib
+            )
+            try await serverEngine.sendPayload(payload)
+
+            let deadline = Date().addingTimeInterval(1)
+            var received = Data()
+            while Date() < deadline {
+                for op in await session.drainHostOps() {
+                    if case .hostBytes(let bytes) = op {
+                        received.append(bytes)
+                    }
+                }
+                if received.range(of: Data(marker.utf8)) != nil {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertNotNil(received.range(of: Data(marker.utf8)))
+
+            let snapshot = try await session.prepareForApplicationBackground()
+            await session.stop()
+            session = try await MoshClientSession.restore(
+                from: snapshot,
+                endpointFactory: { _, _ in clientEnd },
+                snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+            )
+            try await session.start()
+        }
+
+        await session.stop()
+        await serverEngine.stop()
+        await serverEnd.stop()
+    }
+
     /// Simulates real mosh-server behavior: multiple state updates sent with
     /// the same oldNum (based on last acked state) before the client acks.
     /// This is the core mosh protocol pattern that strict oldNum matching breaks.

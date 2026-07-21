@@ -192,13 +192,13 @@ final class CoreAndAdapterTests: XCTestCase {
         let session = MoshClientSession(endpoint: endpoint, config: baseConfig)
 
         let snap1 = try await session.makeSnapshot()
-        XCTAssertEqual(snap1.schemaVersion, 1)
+        XCTAssertEqual(snap1.schemaVersion, 2)
 
         do {
-            _ = try await MoshClientSession.restore(from: MoshSnapshot(endpoint: endpoint, transportState: Data(), createdAtMs: 0, schemaVersion: 2))
+            _ = try await MoshClientSession.restore(from: MoshSnapshot(endpoint: endpoint, transportState: Data(), createdAtMs: 0, schemaVersion: 3))
             XCTFail("Expected badSnapshotSchema")
         } catch {
-            guard case .badSnapshotSchema(2) = error as? MoshSessionError else {
+            guard case .badSnapshotSchema(3) = error as? MoshSessionError else {
                 return XCTFail("Unexpected error: \(error)")
             }
         }
@@ -225,6 +225,29 @@ final class CoreAndAdapterTests: XCTestCase {
         try await restoredDefault.start()
         await restoredDefault.stop()
         await restoredOverride.stop()
+    }
+
+    func testApplicationBackgroundSuspendsAndResumesWithoutEndingSession() async throws {
+        let (clientEnd, _) = await InMemoryDatagramPair.makeLinked()
+        let session = MoshClientSession(
+            endpoint: makeEndpoint(),
+            config: .init(),
+            endpointFactory: { _, _ in clientEnd },
+            snapshotEncoder: { blob in try JSONEncoder().encode(blob) }
+        )
+
+        try await session.start()
+        let snapshot = try await session.prepareForApplicationBackground()
+        let suspendedState = await session.state
+
+        XCTAssertEqual(suspendedState, .suspended)
+        XCTAssertEqual(snapshot.schemaVersion, 2)
+
+        try await session.resumeFromApplicationBackground()
+        let resumedState = await session.state
+        XCTAssertEqual(resumedState, .running)
+
+        await session.stop()
     }
 
     func testSnapshotEncodeFailureInjectedEncoder() async {

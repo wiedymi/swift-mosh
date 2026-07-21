@@ -91,6 +91,12 @@ public actor MoshClientSession {
         if case .starting = state {
             return
         }
+        if case .suspending = state {
+            throw MoshSessionError.notStarted
+        }
+        if case .suspended = state {
+            throw MoshSessionError.notStarted
+        }
         if case .failed(let reason) = state {
             throw MoshSessionError.sessionFailed(reason)
         }
@@ -115,7 +121,7 @@ public actor MoshClientSession {
             lastOutboundAtMs = now
             lastStateSendAtMs = 0
             lastAckSentAtMs = now
-            ackDirtyAtMs = nil
+            ackDirtyAtMs = latestReceivedStateNum > lastAckReportedNum ? now : nil
             consecutiveReceiveFailures = 0
             currentRtoMs = Double(config.initialRtoMs)
             srttMs = nil
@@ -137,7 +143,38 @@ public actor MoshClientSession {
     public func stop() async {
         state = .stopping
         await shutdownRuntime()
+        pendingTransportSnapshot = nil
         state = .stopped
+    }
+
+    public func prepareForApplicationBackground() async throws -> MoshSnapshot {
+        switch state {
+        case .running:
+            state = .suspending
+            await suspendRuntime()
+            state = .suspended
+            return try await makeSnapshot()
+        case .suspended:
+            return try await makeSnapshot()
+        case .failed(let failure):
+            throw MoshSessionError.sessionFailed(failure)
+        case .idle, .starting, .suspending, .stopping, .stopped:
+            throw MoshSessionError.notStarted
+        }
+    }
+
+    public func resumeFromApplicationBackground() async throws {
+        switch state {
+        case .running:
+            return
+        case .suspended:
+            state = .idle
+            try await start()
+        case .failed(let failure):
+            throw MoshSessionError.sessionFailed(failure)
+        case .idle, .starting, .suspending, .stopping, .stopped:
+            throw MoshSessionError.notStarted
+        }
     }
 
     public func enqueue(_ op: MoshClientOp) async throws {
@@ -199,7 +236,25 @@ public actor MoshClientSession {
 
     public func makeSnapshot() async throws -> MoshSnapshot {
         let runtimeSnapshot = await engine?.makeSnapshot() ?? pendingTransportSnapshot ?? TransportRuntimeSnapshot()
-        let blob = SessionStateBlob(config: config, transport: runtimeSnapshot, pendingHostOps: pendingHostOps)
+        let outboundSnapshots = pendingOutboundOrder.compactMap { stateNum in
+            pendingOutbound[stateNum].map {
+                PendingOutboundSnapshot(
+                    stateNum: $0.stateNum,
+                    payload: $0.payload,
+                    retryCount: $0.retryCount
+                )
+            }
+        }
+        let blob = SessionStateBlob(
+            config: config,
+            transport: runtimeSnapshot,
+            pendingHostOps: pendingHostOps,
+            lastSentStateNum: lastSentStateNum,
+            latestReceivedStateNum: latestReceivedStateNum,
+            pendingOutbound: outboundSnapshots,
+            lastAckReportedNum: lastAckReportedNum,
+            appliedRemoteStateNums: appliedRemoteStateNums
+        )
 
         let stateData: Data
         do {
@@ -212,12 +267,34 @@ public actor MoshClientSession {
             endpoint: endpoint,
             transportState: stateData,
             createdAtMs: TransportClock.nowMs(),
-            schemaVersion: 1
+            schemaVersion: 2
         )
     }
 
     public static func restore(from snapshot: MoshSnapshot, config: MoshClientConfig = .init()) async throws -> MoshClientSession {
-        guard snapshot.schemaVersion == 1 else {
+        try await restore(
+            from: snapshot,
+            config: config,
+            endpointFactory: { endpoint, config in
+                NetworkDatagramEndpoint(
+                    remote: UDPTransportEndpointAddress(
+                        host: endpoint.host,
+                        port: endpoint.port
+                    ),
+                    localPort: config.localPort
+                )
+            },
+            snapshotEncoder: Self.defaultSnapshotEncoder
+        )
+    }
+
+    static func restore(
+        from snapshot: MoshSnapshot,
+        config: MoshClientConfig = .init(),
+        endpointFactory: @escaping @Sendable (MoshEndpoint, MoshClientConfig) -> any DatagramEndpoint,
+        snapshotEncoder: @escaping @Sendable (SessionStateBlob) throws -> Data
+    ) async throws -> MoshClientSession {
+        guard (1...2).contains(snapshot.schemaVersion) else {
             throw MoshSessionError.badSnapshotSchema(snapshot.schemaVersion)
         }
 
@@ -229,7 +306,12 @@ public actor MoshClientSession {
         }
 
         let effectiveConfig = config == MoshClientConfig() ? blob.config : config
-        let session = MoshClientSession(endpoint: snapshot.endpoint, config: effectiveConfig)
+        let session = MoshClientSession(
+            endpoint: snapshot.endpoint,
+            config: effectiveConfig,
+            endpointFactory: endpointFactory,
+            snapshotEncoder: snapshotEncoder
+        )
         await session.install(blob: blob)
         return session
     }
@@ -237,6 +319,27 @@ public actor MoshClientSession {
     private func install(blob: SessionStateBlob) {
         pendingHostOps = blob.pendingHostOps
         pendingTransportSnapshot = blob.transport
+        lastSentStateNum = blob.lastSentStateNum
+        latestReceivedStateNum = blob.latestReceivedStateNum
+        lastAckReportedNum = blob.lastAckReportedNum
+        appliedRemoteStateNums = blob.appliedRemoteStateNums
+
+        let now = TransportClock.nowMs()
+        pendingOutbound = Dictionary(
+            uniqueKeysWithValues: blob.pendingOutbound.map { snapshot in
+                (
+                    snapshot.stateNum,
+                    PendingOutboundInstruction(
+                        stateNum: snapshot.stateNum,
+                        payload: snapshot.payload,
+                        retryCount: snapshot.retryCount,
+                        lastSentAtMs: now,
+                        nextRetryAtMs: now &+ UInt64(config.initialRtoMs)
+                    )
+                )
+            }
+        )
+        pendingOutboundOrder = blob.pendingOutbound.map(\.stateNum)
     }
 
     private func receiveLoop() async {
@@ -816,6 +919,20 @@ public actor MoshClientSession {
         }
         engine = nil
         finishHostStreams()
+    }
+
+    private func suspendRuntime() async {
+        receiveTask?.cancel()
+        maintenanceTask?.cancel()
+        receiveTask = nil
+        maintenanceTask = nil
+
+        guard let activeEngine = engine else { return }
+        await activeEngine.stop()
+        pendingTransportSnapshot = await activeEngine.makeSnapshot()
+        if engine === activeEngine {
+            engine = nil
+        }
     }
 
     private func failSession(_ failure: MoshSessionFailure) async {

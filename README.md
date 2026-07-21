@@ -79,6 +79,26 @@ for await op in await session.hostOpStream() {
 await session.stop()
 ```
 
+## App suspension and process relaunch
+
+Freeze the live transport before the app is suspended, then persist the returned
+snapshot atomically:
+
+```swift
+let snapshot = try await session.prepareForApplicationBackground()
+
+// If the process remains alive:
+try await session.resumeFromApplicationBackground()
+
+// After a process relaunch:
+let restored = try await MoshClientSession.restore(from: snapshot)
+try await restored.start()
+```
+
+`MoshSnapshot` contains the Mosh session key and buffered terminal protocol data.
+Treat it as sensitive session material: keep the key in device-only secure storage,
+protect the remaining checkpoint at rest, and delete both on explicit disconnect.
+
 Reliability/lifecycle knobs are configurable in `MoshClientConfig`:
 - `sendMinDelayMs`
 - `ackIntervalMs`

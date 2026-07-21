@@ -5,6 +5,50 @@ import XCTest
 @testable import MoshCore
 
 final class RealMoshServerE2ETests: XCTestCase {
+    func testRealMoshServerRepeatedColdRelaunchRecovery() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
+            throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
+        }
+
+        let host = env["SWIFTMOSH_REAL_E2E_HOST"] ?? "127.0.0.1"
+        let connect = try Self.launchLocalMoshServer(environment: env)
+        defer {
+            if let serverPID = connect.serverPID {
+                Self.terminateServerProcess(pid: serverPID)
+            }
+        }
+
+        var session = MoshClientSession(
+            endpoint: MoshEndpoint(
+                host: host,
+                port: connect.port,
+                keyBase64_22: connect.key
+            ),
+            config: MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
+        )
+        try await session.start()
+
+        for cycle in 1...3 {
+            let marker = "__SWIFTMOSH_RELAUNCH_\(cycle)__"
+            try await session.enqueue(.keystrokes(Data((marker + "\n").utf8)))
+            let output = try await waitForHostBytes(
+                session: session,
+                containing: marker,
+                timeoutSeconds: 3,
+                throwOnTimeout: true
+            )
+            XCTAssertTrue(output?.contains(marker) == true)
+
+            let snapshot = try await session.prepareForApplicationBackground()
+            await session.stop()
+            session = try await MoshClientSession.restore(from: snapshot)
+            try await session.start()
+        }
+
+        await session.stop()
+    }
+
     func testRealMoshServerRoundTrip() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
