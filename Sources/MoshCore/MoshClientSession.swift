@@ -4,6 +4,12 @@ import MoshCryptoOCB
 import MoshProtoLite
 import MoshTransport
 import MoshWire
+import OSLog
+
+private let moshSessionLogger = Logger(
+    subsystem: "com.mymosh.app",
+    category: "MoshClientSession"
+)
 
 public actor MoshClientSession {
     private struct PendingOutboundInstruction: Sendable {
@@ -12,6 +18,22 @@ public actor MoshClientSession {
         var retryCount: UInt32
         var lastSentAtMs: UInt64
         var nextRetryAtMs: UInt64
+    }
+
+    private struct DecodedHostOps: Sendable {
+        var operations: [MoshHostOp]
+        var receivedQuit: Bool
+        var receivedServerShutdown: Bool
+
+        init(
+            operations: [MoshHostOp],
+            receivedQuit: Bool = false,
+            receivedServerShutdown: Bool = false
+        ) {
+            self.operations = operations
+            self.receivedQuit = receivedQuit
+            self.receivedServerShutdown = receivedServerShutdown
+        }
     }
 
     private enum SessionRuntimeError: Error, Sendable {
@@ -56,7 +78,11 @@ public actor MoshClientSession {
 
     private var hostStreamContinuations: [UUID: AsyncStream<MoshHostOp>.Continuation] = [:]
 
+#if DEBUG
+    private let debugEnabled = true
+#else
     private let debugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+#endif
 
     public init(endpoint: MoshEndpoint, config: MoshClientConfig = .init()) {
         self.endpoint = endpoint
@@ -128,6 +154,9 @@ public actor MoshClientSession {
             rttvarMs = nil
 
             state = .running
+            if debugEnabled {
+                debugLog("session started host=\(endpoint.host) port=\(endpoint.port) crypto=\(config.useNetworkCrypto)")
+            }
             self.receiveTask = Task { [weak self] in
                 await self?.receiveLoop()
             }
@@ -395,13 +424,41 @@ public actor MoshClientSession {
 
         do {
             let incoming = try await engine.receivePayload()
+            if debugEnabled {
+                debugLog(
+                    "received packet seq=\(incoming.sequence) direction=\(incoming.direction) payload=\(incoming.payload.count) timestamp=\(incoming.timestamp) reply=\(incoming.timestampReply)"
+                )
+            }
             updateRtt(from: incoming)
 
-            let hostOps = try decodeHostOps(from: incoming)
+            let decodedHostOps = try decodeHostMessage(from: incoming)
             consecutiveReceiveFailures = 0
 
-            if !hostOps.isEmpty {
-                publishHostOps(hostOps)
+            if !decodedHostOps.operations.isEmpty {
+                publishHostOps(decodedHostOps.operations)
+            }
+
+            if decodedHostOps.receivedServerShutdown {
+                if debugEnabled {
+                    debugLog("received server shutdown marker; sending ack_num=UInt64.max")
+                }
+                do {
+                    try await sendAckOnly(nowMs: TransportClock.nowMs())
+                    if debugEnabled {
+                        debugLog("sent server shutdown acknowledgement")
+                    }
+                } catch {
+                    if debugEnabled {
+                        debugLog("failed to send server shutdown acknowledgement: \(error)")
+                    }
+                }
+                await finishSessionNormally()
+                return false
+            }
+
+            if decodedHostOps.receivedQuit {
+                await failSession(.transportFailure("server quit"))
+                return false
             }
 
             if ackDirtyAtMs != nil, latestReceivedStateNum > lastAckReportedNum {
@@ -644,8 +701,12 @@ public actor MoshClientSession {
     }
 
     private func decodeHostOps(from incoming: TransportReceivedPayload) throws -> [MoshHostOp] {
+        try decodeHostMessage(from: incoming).operations
+    }
+
+    private func decodeHostMessage(from incoming: TransportReceivedPayload) throws -> DecodedHostOps {
         guard !incoming.payload.isEmpty else {
-            return []
+            return DecodedHostOps(operations: [], receivedQuit: false)
         }
 
         let codec = MoshCompressionCodec()
@@ -664,7 +725,7 @@ public actor MoshClientSession {
         }
         if debugEnabled {
             debugLog(
-                "decodeHostOps payloadLen=\(incoming.payload.count) decompressedLen=\(decompressed?.count ?? -1) instructionLen=\(instructionBytes.count)"
+                "transport decoded payloadLen=\(incoming.payload.count) decompressedLen=\(decompressed?.count ?? -1) instructionLen=\(instructionBytes.count) raw=\(hexPreview(instructionBytes))"
             )
         }
 
@@ -679,40 +740,88 @@ public actor MoshClientSession {
             pruneAppliedRemoteStates(before: throwaway)
         }
 
+        var receivedServerShutdown = false
         if let newNum = instruction.newNum {
-            if appliedRemoteStateNums.contains(newNum) {
-                return []
+            if newNum == UInt64.max {
+                // Real mosh signals a peer shutdown with new_num == -1, which
+                // is encoded as UINT64_MAX in the protobuf uint64 field. This
+                // is a transport-level signal, not a HostInstruction.Quit.
+                receivedServerShutdown = true
+                latestReceivedStateNum = UInt64.max
+                ackDirtyAtMs = TransportClock.nowMs()
+                if debugEnabled {
+                    debugLog("decoded transport shutdown marker newNum=UInt64.max oldNum=\(instruction.oldNum ?? 0)")
+                }
+            } else {
+                if appliedRemoteStateNums.contains(newNum) {
+                    return DecodedHostOps(operations: [])
+                }
+                if let oldNum = instruction.oldNum, oldNum > latestReceivedStateNum {
+                    return DecodedHostOps(operations: [])
+                }
+                latestReceivedStateNum = max(latestReceivedStateNum, newNum)
+                appliedRemoteStateNums.insert(newNum)
+                if appliedRemoteStateNums.count > 4096 {
+                    let floor = latestReceivedStateNum > 2048 ? latestReceivedStateNum - 2048 : 0
+                    appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= floor })
+                }
+                ackDirtyAtMs = TransportClock.nowMs()
             }
-            if let oldNum = instruction.oldNum, oldNum > latestReceivedStateNum {
-                return []
-            }
-            latestReceivedStateNum = max(latestReceivedStateNum, newNum)
-            appliedRemoteStateNums.insert(newNum)
-            if appliedRemoteStateNums.count > 4096 {
-                let floor = latestReceivedStateNum > 2048 ? latestReceivedStateNum - 2048 : 0
-                appliedRemoteStateNums = Set(appliedRemoteStateNums.filter { $0 >= floor })
-            }
-            ackDirtyAtMs = TransportClock.nowMs()
         }
 
         guard let diff = instruction.diff else {
-            return []
+            return DecodedHostOps(operations: [], receivedServerShutdown: receivedServerShutdown)
         }
 
-        if let hostMessage = try? HostMessage(decoding: diff), !hostMessage.instructions.isEmpty {
-            return hostMessage.instructions.map { instruction in
+        do {
+            let hostMessage = try HostMessage(decoding: diff)
+            if debugEnabled {
+                debugLog(
+                    "host message diffLen=\(diff.count) instructions=\(hostMessage.instructions) raw=\(hexPreview(diff))"
+                )
+            }
+
+            guard !hostMessage.instructions.isEmpty else {
+                if debugEnabled {
+                    debugLog("host message has no recognized instructions; falling back to raw host bytes")
+                }
+                return DecodedHostOps(
+                    operations: [.hostBytes(diff)],
+                    receivedServerShutdown: receivedServerShutdown
+                )
+            }
+
+            var operations: [MoshHostOp] = []
+            var receivedQuit = false
+            for instruction in hostMessage.instructions {
                 switch instruction {
                 case .hostBytes(let bytes):
-                    return .hostBytes(bytes)
+                    operations.append(.hostBytes(bytes))
                 case .resize(let width, let height):
-                    return .resize(cols: width, rows: height)
+                    operations.append(.resize(cols: width, rows: height))
                 case .echoAck(let value):
-                    return .echoAck(value)
+                    operations.append(.echoAck(value))
+                case .quit:
+                    receivedQuit = true
                 }
             }
+            if debugEnabled, receivedQuit {
+                debugLog("recognized server Quit instruction")
+            }
+            return DecodedHostOps(
+                operations: operations,
+                receivedQuit: receivedQuit,
+                receivedServerShutdown: receivedServerShutdown
+            )
+        } catch {
+            if debugEnabled {
+                debugLog("host message decode error=\(error); falling back to raw host bytes raw=\(hexPreview(diff))")
+            }
+            return DecodedHostOps(
+                operations: [.hostBytes(diff)],
+                receivedServerShutdown: receivedServerShutdown
+            )
         }
-
-        return [.hostBytes(diff)]
     }
 
     private func instructionHasContent(_ instruction: TransportInstruction) -> Bool {
@@ -939,9 +1048,21 @@ public actor MoshClientSession {
         if case .failed = state {
             return
         }
+        if debugEnabled {
+            debugLog("session failed: \(failure)")
+        }
         self.failure = failure
         state = .failed(failure)
         await shutdownRuntime()
+    }
+
+    private func finishSessionNormally() async {
+        if debugEnabled {
+            debugLog("session ended normally after server shutdown")
+        }
+        state = .stopping
+        await shutdownRuntime()
+        state = .stopped
     }
 
     private enum ReceiveErrorDisposition {
@@ -993,6 +1114,12 @@ public actor MoshClientSession {
     }
 
     private func debugLog(_ message: String) {
-        FileHandle.standardError.write(Data("[MoshClientSession] \(message)\n".utf8))
+        moshSessionLogger.notice("\(message, privacy: .public)")
+    }
+
+    private func hexPreview(_ data: Data, limit: Int = 160) -> String {
+        let bytes = data.prefix(limit)
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        return data.count > limit ? "\(hex)…" : hex
     }
 }

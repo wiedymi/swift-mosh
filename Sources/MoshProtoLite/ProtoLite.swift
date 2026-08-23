@@ -1,4 +1,16 @@
 import Foundation
+import OSLog
+
+private let protoLiteLogger = Logger(
+    subsystem: "com.mymosh.app",
+    category: "MoshProtoLite"
+)
+
+#if DEBUG
+private let protoLiteDebugEnabled = true
+#else
+private let protoLiteDebugEnabled = ProcessInfo.processInfo.environment["SWIFTMOSH_DEBUG_REAL_E2E"] == "1"
+#endif
 
 public enum ProtoLiteError: Error, Sendable {
     case truncated
@@ -109,6 +121,7 @@ public enum HostInstruction: Sendable, Hashable, Codable {
     case hostBytes(Data)
     case resize(width: Int32, height: Int32)
     case echoAck(UInt64)
+    case quit
 }
 
 public struct HostMessage: Sendable, Hashable, Codable {
@@ -137,6 +150,7 @@ public struct HostMessage: Sendable, Hashable, Codable {
                 let payload = try reader.readLengthDelimited()
                 instructions.append(try Self.decodeHostInstruction(payload))
             default:
+                logSkippedProtoField("HostMessage", field: field, wire: wire)
                 try reader.skip(wireType: wire)
             }
         }
@@ -160,6 +174,8 @@ public struct HostMessage: Sendable, Hashable, Codable {
             var echo = Data()
             ProtoWriter.writeVarintField(number: 8, value: value, to: &echo)
             ProtoWriter.writeBytesField(number: 7, value: echo, to: &data)
+        case .quit:
+            ProtoWriter.writeBytesField(number: 9, value: Data(), to: &data)
         }
         return data
     }
@@ -179,7 +195,11 @@ public struct HostMessage: Sendable, Hashable, Codable {
             case (7, .lengthDelimited):
                 let echoPayload = try reader.readLengthDelimited()
                 result = try decodeEchoAck(echoPayload)
+            case (9, .lengthDelimited):
+                _ = try reader.readLengthDelimited()
+                result = .quit
             default:
+                logSkippedProtoField("HostInstruction", field: field, wire: wire)
                 try reader.skip(wireType: wire)
             }
         }
@@ -363,6 +383,17 @@ private enum ProtoWireType: UInt64 {
     case fixed64 = 1
     case lengthDelimited = 2
     case fixed32 = 5
+}
+
+private func logSkippedProtoField(
+    _ message: String,
+    field: UInt64,
+    wire: ProtoWireType
+) {
+    guard protoLiteDebugEnabled else { return }
+    protoLiteLogger.notice(
+        "\(message, privacy: .public) skipped field=\(field, privacy: .public) wire=\(wire.rawValue, privacy: .public)"
+    )
 }
 
 private enum ProtoWriter {

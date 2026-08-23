@@ -995,6 +995,91 @@ final class CoreAndAdapterTests: XCTestCase {
         await server.stop()
     }
 
+    func testServerQuitFailsSessionAndFinishesHostOpStream() async throws {
+        let config = MoshClientConfig(maxReceiveStates: 8, mtu: 256, useNetworkCrypto: false)
+        let (session, server) = await makeInMemorySession(config: config)
+        try await server.start()
+        try await session.start()
+
+        let stream = await session.hostOpStream()
+        let finished = expectation(description: "host op stream finished after server quit")
+        let reader = Task {
+            for await _ in stream {}
+            finished.fulfill()
+        }
+
+        let instruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: 0,
+            newNum: 1,
+            diff: HostMessage(instructions: [.quit]).encoded()
+        )
+        try await server.sendPayload(
+            try encodeInstructionPayload(instruction, compressed: true)
+        )
+
+        let failure = await waitForFailure(session: session, timeoutNs: 1_000_000_000)
+        XCTAssertEqual(failure, .transportFailure("server quit"))
+        await fulfillment(of: [finished], timeout: 1.0)
+
+        _ = await reader.result
+        await session.stop()
+        await server.stop()
+    }
+
+    func testServerShutdownMarkerAcknowledgesAndFinishesSession() async throws {
+        let config = MoshClientConfig(maxReceiveStates: 8, mtu: 256, useNetworkCrypto: false)
+        let (session, server) = await makeInMemorySession(config: config)
+        try await server.start()
+        try await session.start()
+
+        let stream = await session.hostOpStream()
+        let finished = expectation(description: "host op stream finished after server shutdown")
+        let reader = Task {
+            for await _ in stream {}
+            finished.fulfill()
+        }
+
+        let shutdownInstruction = TransportInstruction(
+            protocolVersion: MoshWire.protocolVersion,
+            oldNum: 0,
+            newNum: UInt64.max,
+            ackNum: 0,
+            throwawayNum: 0,
+            diff: Data()
+        )
+        try await server.sendPayload(
+            try encodeInstructionPayload(shutdownInstruction, compressed: true)
+        )
+
+        let acknowledgement = try await receivePayloadEventually(
+            engine: server,
+            timeoutNs: 1_000_000_000
+        )
+        let acknowledgementInstruction = try decodeInstructionPayload(
+            acknowledgement.payload,
+            compressed: true
+        )
+        XCTAssertEqual(acknowledgementInstruction.ackNum, UInt64.max)
+
+        for _ in 0..<50 {
+            let state = await session.state
+            if state == .stopped {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let finalState = await session.state
+        let finalFailure = await session.failure
+        XCTAssertEqual(finalState, .stopped)
+        XCTAssertNil(finalFailure)
+        await fulfillment(of: [finished], timeout: 1.0)
+
+        _ = await reader.result
+        await session.stop()
+        await server.stop()
+    }
+
     func testAckDelayAndHeartbeatWiring() async throws {
         var config = MoshClientConfig(
             sendMinDelayMs: 0,
