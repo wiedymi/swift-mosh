@@ -68,7 +68,8 @@ final class ProtoLiteTests: XCTestCase {
             instructions: [
                 .hostBytes(Data([0x41, 0x42])),
                 .resize(width: -80, height: 24),
-                .echoAck(999)
+                .echoAck(999),
+                .quit
             ]
         )
         let decoded = try HostMessage(decoding: message.encoded())
@@ -85,6 +86,7 @@ final class ProtoLiteTests: XCTestCase {
         let echoPayload = varintField(number: 8, value: 1234)
             + fixed32Field(number: 22, bytes: [9, 9, 9, 9]) // decodeEchoAck default -> skip
         let innerEcho = lengthDelimitedField(number: 7, payload: echoPayload)
+        let innerQuit = lengthDelimitedField(number: 9, payload: [])
 
         var top: [UInt8] = []
         top += varintField(number: 30, value: 10) // HostMessage default -> skip varint
@@ -94,9 +96,10 @@ final class ProtoLiteTests: XCTestCase {
         top += lengthDelimitedField(number: 1, payload: innerHostBytes)
         top += lengthDelimitedField(number: 1, payload: innerResize)
         top += lengthDelimitedField(number: 1, payload: innerEcho)
+        top += lengthDelimitedField(number: 1, payload: innerQuit)
 
         let parsed = try HostMessage(decoding: Data(top))
-        XCTAssertEqual(parsed.instructions.count, 3)
+        XCTAssertEqual(parsed.instructions.count, 4)
 
         if case .hostBytes(let bytes) = parsed.instructions[0] {
             XCTAssertEqual(bytes, Data([0xDE, 0xAD]))
@@ -115,6 +118,10 @@ final class ProtoLiteTests: XCTestCase {
             XCTAssertEqual(value, 1234)
         } else {
             XCTFail("Expected echoAck")
+        }
+
+        guard case .quit = parsed.instructions[3] else {
+            return XCTFail("Expected quit")
         }
     }
 
