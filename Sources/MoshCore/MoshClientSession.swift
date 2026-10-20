@@ -404,6 +404,14 @@ public actor MoshClientSession {
                 publishHostOps(hostOps)
             }
 
+            // UINT64_MAX is the peer's final transport state, not another live update.
+            if latestReceivedStateNum == UInt64.max {
+                state = .stopping
+                try? await sendAckOnly(nowMs: TransportClock.nowMs())
+                await stop()
+                return false
+            }
+
             if ackDirtyAtMs != nil, latestReceivedStateNum > lastAckReportedNum {
                 try? await sendAckOnly(nowMs: TransportClock.nowMs())
             }
@@ -695,7 +703,7 @@ public actor MoshClientSession {
             ackDirtyAtMs = TransportClock.nowMs()
         }
 
-        guard let diff = instruction.diff else {
+        guard let diff = instruction.diff, !diff.isEmpty else {
             return []
         }
 

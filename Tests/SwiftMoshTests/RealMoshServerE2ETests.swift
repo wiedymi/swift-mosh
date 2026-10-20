@@ -5,6 +5,46 @@ import XCTest
 @testable import MoshCore
 
 final class RealMoshServerE2ETests: XCTestCase {
+    func testRealMoshServerShutdownFinishesSession() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
+            throw XCTSkip("Set SWIFTMOSH_REAL_E2E=1 to run real mosh-server integration tests.")
+        }
+        let connect = try Self.launchLocalMoshServer(environment: env)
+        let serverPID = try XCTUnwrap(connect.serverPID)
+        defer { Self.terminateServerProcess(pid: serverPID) }
+
+        let session = MoshClientSession(
+            endpoint: MoshEndpoint(host: "127.0.0.1", port: connect.port, keyBase64_22: connect.key),
+            config: MoshClientConfig(maxReceiveStates: 2048, mtu: 1200)
+        )
+        do {
+            try await session.start()
+            let marker = "__SWIFTMOSH_SHUTDOWN__"
+            try await session.enqueue(.keystrokes(Data((marker + "\n").utf8)))
+            _ = try await waitForHostBytes(session: session, containing: marker, timeoutSeconds: 3, throwOnTimeout: true)
+
+            let stream = await session.hostOpStream()
+            let finished = expectation(description: "real server shutdown finishes host stream")
+            let reader = Task {
+                for await _ in stream {}
+                finished.fulfill()
+            }
+            XCTAssertEqual(kill(serverPID, SIGTERM), 0)
+            await fulfillment(of: [finished], timeout: 5)
+            let state = await session.state
+            let failure = await session.failure
+            XCTAssertEqual(state, .stopped)
+            XCTAssertNil(failure)
+            reader.cancel()
+            await session.stop()
+            await reader.value
+        } catch {
+            await session.stop()
+            throw error
+        }
+    }
+
     func testRealMoshServerRepeatedColdRelaunchRecovery() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["SWIFTMOSH_REAL_E2E"] == "1" else {
